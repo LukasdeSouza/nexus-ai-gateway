@@ -1,0 +1,95 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexus-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nexus"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: nexus-jaeger
+    restart: always
+    ports:
+      - "16686:16686" # Web UI
+      - "4318:4318"   # OTLP HTTP receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: nexus-prometheus
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: nexus-grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+
+  gateway-api:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.gateway-api
+    container_name: nexus-gateway-api
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_PORT: "8080"
+      ENV: "local"
+      DATABASE_URL: "postgres://postgres:password@postgres:5432/nexus?sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      METRICS_ENABLED: "true"
+      TRACING_ENABLED: "true"
+      LOG_LEVEL: "debug"
+      MIGRATIONS_PATH: "migrations"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
