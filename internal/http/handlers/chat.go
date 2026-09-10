@@ -1,4 +1,4 @@
-// Package handlers contains HTTP request handlers.
+﻿// Package handlers contains HTTP request handlers.
 package handlers
 
 import (
@@ -16,14 +16,10 @@ import (
 	"github.com/LukasdeSouza/nexus-ai-gateway/internal/observability"
 	"github.com/LukasdeSouza/nexus-ai-gateway/internal/provider"
 	"github.com/LukasdeSouza/nexus-ai-gateway/internal/ratelimit"
+	"github.com/LukasdeSouza/nexus-ai-gateway/internal/routing"
 	"github.com/LukasdeSouza/nexus-ai-gateway/internal/tenant"
 	"github.com/LukasdeSouza/nexus-ai-gateway/internal/usage"
 )
-
-// ChatService is the interface the chat handler depends on to select a provider and call it.
-type ChatService interface {
-	SelectProvider(ctx context.Context, req *provider.ChatRequest, policy *domain.RoutingPolicy) (provider.Provider, string, error)
-}
 
 // ProviderStore looks up ProviderConnection records for a project.
 type ProviderConnectionStore interface {
@@ -42,29 +38,30 @@ type RequestRecordStore interface {
 
 // ChatHandler handles POST /v1/chat/completions.
 type ChatHandler struct {
-	validator       *auth.Validator
-	tenantResolver  *tenant.Resolver
-	rateLimiter     *ratelimit.Limiter
-	providerReg     *provider.Registry
-	policyStore     RoutingPolicyStore
-	requestStore    RequestRecordStore
-	usageProducer   usage.Producer
-	metrics         *observability.Metrics
-	logger          *zap.Logger
+	validator        *auth.Validator
+	tenantResolver   *tenant.Resolver
+	rateLimiter      *ratelimit.Limiter
+	providerReg      *provider.Registry
+	routingEngine    *routing.Engine
+	policyStore      RoutingPolicyStore
+	requestStore     RequestRecordStore
+	usageProducer    usage.Producer
+	metrics          *observability.Metrics
+	logger           *zap.Logger
 	defaultRateLimit ratelimit.Limit
 }
 
 // ChatHandlerConfig holds constructor arguments for ChatHandler.
 type ChatHandlerConfig struct {
-	Validator       *auth.Validator
-	TenantResolver  *tenant.Resolver
-	RateLimiter     *ratelimit.Limiter
-	ProviderReg     *provider.Registry
-	PolicyStore     RoutingPolicyStore
-	RequestStore    RequestRecordStore
-	UsageProducer   usage.Producer
-	Metrics         *observability.Metrics
-	Logger          *zap.Logger
+	Validator        *auth.Validator
+	TenantResolver   *tenant.Resolver
+	RateLimiter      *ratelimit.Limiter
+	ProviderReg      *provider.Registry
+	PolicyStore      RoutingPolicyStore
+	RequestStore     RequestRecordStore
+	UsageProducer    usage.Producer
+	Metrics          *observability.Metrics
+	Logger           *zap.Logger
 	DefaultRateLimit ratelimit.Limit
 }
 
@@ -75,6 +72,7 @@ func NewChatHandler(cfg ChatHandlerConfig) *ChatHandler {
 		tenantResolver:   cfg.TenantResolver,
 		rateLimiter:      cfg.RateLimiter,
 		providerReg:      cfg.ProviderReg,
+		routingEngine:    routing.NewEngine(cfg.ProviderReg),
 		policyStore:      cfg.PolicyStore,
 		requestStore:     cfg.RequestStore,
 		usageProducer:    cfg.UsageProducer,
@@ -86,15 +84,15 @@ func NewChatHandler(cfg ChatHandlerConfig) *ChatHandler {
 
 // chatCompletionRequest is the OpenAI-compatible request body.
 type chatCompletionRequest struct {
-	Model       string              `json:"model"`
-	Messages    []messageRequest    `json:"messages"`
-	Stream      bool                `json:"stream"`
-	MaxTokens   *int                `json:"max_tokens,omitempty"`
-	Temperature *float32            `json:"temperature,omitempty"`
-	TopP        *float32            `json:"top_p,omitempty"`
-	Stop        []string            `json:"stop,omitempty"`
-	User        string              `json:"user,omitempty"`
-	Metadata    map[string]string   `json:"metadata,omitempty"`
+	Model       string            `json:"model"`
+	Messages    []messageRequest  `json:"messages"`
+	Stream      bool              `json:"stream"`
+	MaxTokens   *int              `json:"max_tokens,omitempty"`
+	Temperature *float32          `json:"temperature,omitempty"`
+	TopP        *float32          `json:"top_p,omitempty"`
+	Stop        []string          `json:"stop,omitempty"`
+	User        string            `json:"user,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
 type messageRequest struct {
@@ -102,11 +100,19 @@ type messageRequest struct {
 	Content string `json:"content"`
 }
 
-// ServeHTTP implements http.Handler.
+// ServeHTTP handles the chat completions endpoint.
 func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"method not allowed","code":"method_not_allowed"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	requestID := r.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = domain.NewRequestRecord("", "").RequestID
+	}
 	ctx := r.Context()
-	requestID := observability.RequestIDFromContext(ctx)
-	log := observability.FromContext(ctx)
+	log := observability.WithRequestID(h.logger, requestID)
 
 	// 1. Authenticate
 	bearerToken := extractBearerToken(r)
@@ -138,7 +144,6 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result, err := h.rateLimiter.Check(ctx, ratelimit.ScopeProject, tc.Project.ID, h.defaultRateLimit)
 	if err != nil {
 		log.Warn("rate limit check error", zap.Error(err))
-		// fail open on limiter errors to avoid blocking traffic
 	} else if !result.Allowed {
 		h.metrics.RateLimitRejectionsTotal.WithLabelValues("project").Inc()
 		w.Header().Set("X-RateLimit-Limit", fmt.Sprintf("%d", result.Limit))
@@ -172,7 +177,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ProjectID:   tc.Project.ID,
 	}
 
-	// Apply Caveman mode (default on, or enabled via header/metadata)
+	// Apply Caveman mode
 	cavemanEnabled := true
 	if val, ok := reqBody.Metadata["caveman"]; ok && (val == "false" || val == "off" || val == "0") {
 		cavemanEnabled = false
@@ -184,7 +189,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if cavemanEnabled {
 		cavemanPrompt := "Respond directly and concisely. No fluff, no filler, no introductory pleasantries, no conversational padding. Optimize for brevity and token savings."
 		hasSystem := false
-		for i, m := range reqBody.Messages {
+		for _, m := range reqBody.Messages {
 			if strings.ToLower(m.Role) == "system" {
 				provReq.Messages = append(provReq.Messages, provider.Message{
 					Role:    m.Role,
@@ -197,7 +202,6 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					Content: m.Content,
 				})
 			}
-			_ = i
 		}
 		if !hasSystem {
 			provReq.Messages = append([]provider.Message{{Role: "system", Content: cavemanPrompt}}, provReq.Messages...)
@@ -214,16 +218,23 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 7. Resolve routing policy
 	policy, err := h.policyStore.GetActiveByProject(ctx, tc.Project.ID)
 	if err != nil {
-		// Fall back to first available provider if no policy set
 		log.Warn("no active routing policy, using first registered provider", zap.Error(err))
 	}
 
-	// 8. Select provider from registry
-	selectedProvider, selectedModel, err := h.selectProvider(ctx, provReq, policy)
+	// 8. Select provider via Routing Engine
+	selectedProvider, decision, err := h.routingEngine.Route(provReq, policy)
 	if err != nil {
 		writeError(w, requestID, err)
 		return
 	}
+
+	// Set decision headers on response for client observability
+	w.Header().Set("X-Nexus-Route-Model", decision.SelectedModel)
+	w.Header().Set("X-Nexus-Route-Provider", decision.ProviderID)
+	w.Header().Set("X-Nexus-Route-Tier", decision.Tier)
+	w.Header().Set("X-Nexus-Route-Complexity", fmt.Sprintf("%.2f", decision.Complexity))
+	w.Header().Set("X-Nexus-Route-Intent", decision.Intent)
+	w.Header().Set("X-Nexus-Route-Rationale", decision.Rationale)
 
 	// 9. Create request record
 	record := domain.NewRequestRecord(requestID, tc.Project.ID)
@@ -232,11 +243,11 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 10. Execute request
-	provReq.Model = selectedModel
+	provReq.Model = decision.SelectedModel
 	start := time.Now()
 
 	if reqBody.Stream {
-		h.handleStream(w, r, ctx, selectedProvider, selectedModel, provReq, record, start, requestID, tc.Project.ID)
+		h.handleStream(w, r, ctx, selectedProvider, decision.SelectedModel, provReq, record, start, requestID, tc.Project.ID, decision)
 		return
 	}
 
@@ -246,29 +257,29 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		record.Fail(domain.CodeOf(err), latencyMS)
 		h.saveAndEmit(ctx, record, tc.Project.ID)
-		h.metrics.ProviderRequestsTotal.WithLabelValues(selectedProvider.ID(), selectedModel, "error").Inc()
+		h.metrics.ProviderRequestsTotal.WithLabelValues(selectedProvider.ID(), decision.SelectedModel, "error").Inc()
 		writeError(w, requestID, err)
 		return
 	}
 
 	// 11. Record metrics and complete the record
-	cost := estimateCost(selectedModel, resp.Usage)
-	record.Complete(domain.ProviderID(selectedProvider.ID()), selectedModel, domain.TokenUsage{
+	cost := estimateCost(decision.SelectedModel, resp.Usage)
+	record.Complete(domain.ProviderID(selectedProvider.ID()), decision.SelectedModel, domain.TokenUsage{
 		InputTokens:  resp.Usage.InputTokens,
 		OutputTokens: resp.Usage.OutputTokens,
 		TotalTokens:  resp.Usage.TotalTokens,
 	}, latencyMS, cost)
 
-	h.metrics.ProviderRequestsTotal.WithLabelValues(selectedProvider.ID(), selectedModel, "success").Inc()
-	h.metrics.ProviderRequestDuration.WithLabelValues(selectedProvider.ID(), selectedModel).Observe(float64(latencyMS) / 1000)
-	h.metrics.LLMTokensTotal.WithLabelValues("input", selectedProvider.ID(), selectedModel).Add(float64(resp.Usage.InputTokens))
-	h.metrics.LLMTokensTotal.WithLabelValues("output", selectedProvider.ID(), selectedModel).Add(float64(resp.Usage.OutputTokens))
+	h.metrics.ProviderRequestsTotal.WithLabelValues(selectedProvider.ID(), decision.SelectedModel, "success").Inc()
+	h.metrics.ProviderRequestDuration.WithLabelValues(selectedProvider.ID(), decision.SelectedModel).Observe(float64(latencyMS) / 1000)
+	h.metrics.LLMTokensTotal.WithLabelValues("input", selectedProvider.ID(), decision.SelectedModel).Add(float64(resp.Usage.InputTokens))
+	h.metrics.LLMTokensTotal.WithLabelValues("output", selectedProvider.ID(), decision.SelectedModel).Add(float64(resp.Usage.OutputTokens))
 
 	// 12. Save record and emit usage event asynchronously
 	h.saveAndEmit(ctx, record, tc.Project.ID)
 
-	// 13. Respond — OpenAI-compatible shape
-	writeJSON(w, http.StatusOK, toOpenAIResponse(resp, requestID))
+	// 13. Respond — OpenAI-compatible shape with nexus routing metadata
+	writeJSON(w, http.StatusOK, toOpenAIResponse(resp, requestID, decision))
 }
 
 // handleStream writes an SSE streaming response.
@@ -276,7 +287,7 @@ func (h *ChatHandler) handleStream(
 	w http.ResponseWriter, r *http.Request, ctx context.Context,
 	prov provider.Provider, model string, req *provider.ChatRequest,
 	record *domain.RequestRecord, start time.Time,
-	requestID, projectID string,
+	requestID, projectID string, decision *routing.Decision,
 ) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -286,26 +297,37 @@ func (h *ChatHandler) handleStream(
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		writeError(w, requestID, domain.New(domain.CodeInternal, "streaming unsupported by transport"))
 		return
 	}
 
-	ch, err := prov.StreamChat(ctx, req)
+	chunkCh, err := prov.StreamChat(ctx, req)
 	if err != nil {
 		record.Fail(domain.CodeOf(err), time.Since(start).Milliseconds())
 		h.saveAndEmit(ctx, record, projectID)
+		h.metrics.ProviderRequestsTotal.WithLabelValues(prov.ID(), model, "error").Inc()
+		errObj := map[string]interface{}{"error": map[string]string{"message": err.Error(), "code": string(domain.CodeOf(err))}}
+		data, _ := json.Marshal(errObj)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
 		return
 	}
 
 	var finalUsage *provider.TokenUsage
-	for chunk := range ch {
+	for chunk := range chunkCh {
 		if chunk.Err != nil {
+			h.logger.Warn("stream chunk error", zap.Error(chunk.Err), zap.String("request_id", requestID))
 			break
 		}
 		if chunk.Usage != nil {
 			finalUsage = chunk.Usage
 		}
-		data, _ := marshalSSEChunk(chunk, requestID)
+
+		data, err := marshalSSEChunk(chunk, requestID)
+		if err != nil {
+			h.logger.Warn("failed to marshal chunk", zap.Error(err))
+			continue
+		}
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
 	}
@@ -328,151 +350,7 @@ func (h *ChatHandler) handleStream(
 	h.saveAndEmit(ctx, record, projectID)
 }
 
-// selectProvider resolves the provider to use based on policy, auto complexity, or tiered aliases.
-func (h *ChatHandler) selectProvider(ctx context.Context, req *provider.ChatRequest, policy *domain.RoutingPolicy) (provider.Provider, string, error) {
-	all := h.providerReg.All()
-	if len(all) == 0 {
-		return nil, "", domain.New(domain.CodeProviderUnavailable, "no providers registered")
-	}
-
-	if policy != nil && len(policy.Candidates) > 0 {
-		c := policy.Candidates[0]
-		if p, ok := h.providerReg.Get(string(c.Provider)); ok {
-			return p, c.Model, nil
-		}
-	}
-
-	model := req.Model
-	if model == "" {
-		model = "auto"
-	}
-
-	// Model tier mappings per provider:
-	// fast/cheap tier: gemini-2.0-flash (Google), gpt-4o-mini (OpenAI), claude-3-haiku (Anthropic)
-	// smart/quality tier: gpt-4o (OpenAI), claude-3-5-sonnet (Anthropic), gemini-1.5-pro (Google)
-
-	// Check which providers are registered
-	_, hasGemini := h.providerReg.Get("gemini")
-	_, hasOpenAI := h.providerReg.Get("openai")
-	_, hasAnthropic := h.providerReg.Get("anthropic")
-
-	// Helper to resolve fast/cheap tier based on registered providers (cheapest first: Gemini -> OpenAI -> Anthropic)
-	pickFastTier := func() (provider.Provider, string) {
-		if hasGemini {
-			p, _ := h.providerReg.Get("gemini")
-			return p, "gemini-3.6-flash"
-		}
-		if hasOpenAI {
-			p, _ := h.providerReg.Get("openai")
-			return p, "gpt-4o-mini"
-		}
-		if hasAnthropic {
-			p, _ := h.providerReg.Get("anthropic")
-			return p, "claude-3-haiku-20240307"
-		}
-		return all[0], "gemini-3.6-flash"
-	}
-
-	// Helper to resolve smart/quality tier (reasoning first: OpenAI -> Anthropic -> Gemini)
-	pickSmartTier := func() (provider.Provider, string) {
-		if hasOpenAI {
-			p, _ := h.providerReg.Get("openai")
-			return p, "gpt-4o"
-		}
-		if hasAnthropic {
-			p, _ := h.providerReg.Get("anthropic")
-			return p, "claude-3-5-sonnet-20241022"
-		}
-		if hasGemini {
-			p, _ := h.providerReg.Get("gemini")
-			return p, "gemini-2.5-pro"
-		}
-		return all[0], "gpt-4o"
-	}
-
-	var prov provider.Provider
-
-	switch {
-	case model == "auto":
-		// Complexity detection:
-		// Analyze the latest user prompt
-		isComplex := isTaskComplex(req.Messages)
-		if isComplex {
-			prov, model = pickSmartTier()
-		} else {
-			prov, model = pickFastTier()
-		}
-
-	case model == "cheap" || model == "fast":
-		prov, model = pickFastTier()
-
-	case model == "smart" || model == "quality":
-		prov, model = pickSmartTier()
-
-	case strings.HasPrefix(model, "claude-"):
-		prov, _ = h.providerReg.Get("anthropic")
-	case strings.HasPrefix(model, "gemini-"):
-		prov, _ = h.providerReg.Get("gemini")
-	case strings.HasPrefix(model, "gpt-"):
-		prov, _ = h.providerReg.Get("openai")
-	default:
-		// Try exact provider lookup or fallback
-		if p, ok := h.providerReg.Get(model); ok {
-			prov = p
-		} else {
-			prov, model = pickFastTier()
-		}
-	}
-
-	if prov == nil {
-		prov = all[0]
-	}
-	return prov, model, nil
-}
-
-// isTaskComplex inspects messages to determine if a heavy/smart model is needed vs a fast/cheap one.
-func isTaskComplex(messages []provider.Message) bool {
-	if len(messages) == 0 {
-		return false
-	}
-
-	// Find the last user message
-	var lastUserContent string
-	totalLen := 0
-	for _, m := range messages {
-		totalLen += len(m.Content)
-		if strings.ToLower(m.Role) == "user" {
-			lastUserContent = m.Content
-		}
-	}
-
-	// If the entire conversation is long (> 3000 chars), task likely has substantial context
-	if totalLen > 3000 {
-		return true
-	}
-
-	lower := strings.ToLower(lastUserContent)
-
-	// Direct indicators of complex technical or reasoning requirements
-	complexKeywords := []string{
-		"refactor", "arquitetura", "architecture", "benchmark", "concorrência",
-		"concurrency", "deadlock", "race condition", "microservices", "kubernetes",
-		"debug this stacktrace", "otimize este algoritmo", "complexidade de tempo",
-		"big-o", "transação distribuída", "distributed transaction", "explain why this bug happens",
-		"escreva uma tese", "análise aprofundada", "deep analysis",
-	}
-
-	for _, kw := range complexKeywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-
-	// If prompt is short (< 500 chars) and has no complex keywords, it's a simple task
-	return false
-}
-
-// saveAndEmit persists the request record and emits a usage event — both are best-effort.
+// saveAndEmit persists the request record and emits a usage event.
 func (h *ChatHandler) saveAndEmit(ctx context.Context, record *domain.RequestRecord, projectID string) {
 	go func() {
 		bgCtx := context.Background()
@@ -486,7 +364,6 @@ func (h *ChatHandler) saveAndEmit(ctx context.Context, record *domain.RequestRec
 	}()
 }
 
-// extractBearerToken pulls the token from "Authorization: Bearer <token>".
 func extractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
@@ -496,8 +373,7 @@ func extractBearerToken(r *http.Request) string {
 	return ""
 }
 
-// toOpenAIResponse converts the internal ChatResponse to the OpenAI-compatible wire format.
-func toOpenAIResponse(resp *provider.ChatResponse, requestID string) map[string]interface{} {
+func toOpenAIResponse(resp *provider.ChatResponse, requestID string, decision *routing.Decision) map[string]interface{} {
 	choices := make([]map[string]interface{}, 0, len(resp.Choices))
 	for _, c := range resp.Choices {
 		choices = append(choices, map[string]interface{}{
@@ -506,7 +382,8 @@ func toOpenAIResponse(resp *provider.ChatResponse, requestID string) map[string]
 			"finish_reason": c.FinishReason,
 		})
 	}
-	return map[string]interface{}{
+
+	res := map[string]interface{}{
 		"id":      resp.ID,
 		"object":  "chat.completion",
 		"created": resp.Created,
@@ -519,9 +396,23 @@ func toOpenAIResponse(resp *provider.ChatResponse, requestID string) map[string]
 		},
 		"x_request_id": requestID,
 	}
+
+	if decision != nil {
+		res["nexus_routing"] = map[string]interface{}{
+			"requested_model":  decision.RequestedModel,
+			"selected_model":   decision.SelectedModel,
+			"provider":         decision.ProviderID,
+			"tier":             decision.Tier,
+			"complexity_score": decision.Complexity,
+			"intent":           decision.Intent,
+			"rationale":        decision.Rationale,
+			"context_chars":    decision.ContextChars,
+		}
+	}
+
+	return res
 }
 
-// marshalSSEChunk converts a streaming chunk to JSON for SSE output.
 func marshalSSEChunk(chunk provider.ChatChunk, requestID string) ([]byte, error) {
 	choices := make([]map[string]interface{}, 0, len(chunk.Choices))
 	for _, c := range chunk.Choices {
@@ -548,8 +439,6 @@ func nilIfEmpty(s string) interface{} {
 	return s
 }
 
-// estimateCost calculates the estimated USD cost given a model and token usage.
-// Prices are approximate and should be kept in sync with model_aliases table.
 func estimateCost(model string, usage provider.TokenUsage) float64 {
 	type pricing struct{ input, output float64 }
 	prices := map[string]pricing{

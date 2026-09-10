@@ -1,4 +1,4 @@
-// Command nexus-cli provides terminal administration, diagnostics, and an interactive chat REPL for Nexus AI Gateway.
+﻿// Command nexus-cli provides terminal administration, diagnostics, and an interactive chat REPL for Nexus AI Gateway.
 package main
 
 import (
@@ -161,6 +161,19 @@ type Credentials struct {
 	ProjectID string `json:"project_id,omitempty"`
 }
 
+// RoutingMeta holds gateway decision metadata
+
+type RoutingMeta struct {
+	RequestedModel  string  `json:"requested_model"`
+	SelectedModel   string  `json:"selected_model"`
+	Provider        string  `json:"provider"`
+	Tier            string  `json:"tier"`
+	ComplexityScore float64 `json:"complexity_score"`
+	Intent          string  `json:"intent"`
+	Rationale       string  `json:"rationale"`
+	ContextChars    int     `json:"context_chars"`
+}
+
 // ChatResult
 
 type ChatResult struct {
@@ -170,6 +183,7 @@ type ChatResult struct {
 	OutputTokens int
 	Latency      time.Duration
 	Cost         float64
+	Routing      *RoutingMeta
 }
 
 // main
@@ -365,7 +379,7 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 	for {
 		cavemanTag := ""
 		if caveman {
-			cavemanTag = green("⚡caveman") + " "
+			cavemanTag = green("[caveman]") + " "
 		}
 		fmt.Printf("%s %s[%s] > ", cyan("nexus"), cavemanTag, yellow(model))
 		if !scanner.Scan() {
@@ -458,7 +472,7 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 
 		history = append(history, map[string]string{"role": "user", "content": input})
 
-		spinner := newSpinner("Nexus is thinking...")
+		spinner := newSpinner("Nexus is analyzing and routing...")
 		spinner.Start()
 
 		result, err := sendChatConversation(baseURL, apiKey, model, history, caveman)
@@ -475,9 +489,26 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 
 		history = append(history, map[string]string{"role": "assistant", "content": result.Content})
 
+		// Print Routing Thought Process
+		if result.Routing != nil {
+			printRoutingDecision(result.Routing)
+		}
+
 		fmt.Printf("\n%s %s\n", bold(cyan("Nexus:")), result.Content)
 		printResponseMeta(result, model)
 	}
+}
+
+func printRoutingDecision(r *RoutingMeta) {
+	fmt.Println()
+	fmt.Printf("  %s\n", bold("[Nexus Routing Engine]"))
+	fmt.Printf("  |- Intent detected: %s %s\n", cyan(r.Intent), dim(fmt.Sprintf("(score: %.2f)", r.ComplexityScore)))
+	fmt.Printf("  |- Rationale:       %s\n", dim(r.Rationale))
+	fmt.Printf("  |- Decision:        %s -> %s (%s)\n",
+		yellow("["+r.Tier+"]"),
+		bold(r.SelectedModel),
+		r.Provider,
+	)
 }
 
 func printBanner(model, baseURL, projectID string, caveman bool) {
@@ -676,6 +707,7 @@ func sendChatConversation(baseURL, apiKey, model string, messages []map[string]s
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
 		} `json:"usage"`
+		NexusRouting *RoutingMeta `json:"nexus_routing"`
 	}
 	if err := json.Unmarshal(body, &chatResp); err != nil {
 		return ChatResult{}, err
@@ -695,6 +727,7 @@ func sendChatConversation(baseURL, apiKey, model string, messages []map[string]s
 		OutputTokens: outputTok,
 		Latency:      latency,
 		Cost:         cost,
+		Routing:      chatResp.NexusRouting,
 	}, nil
 }
 
@@ -872,6 +905,9 @@ func sendSingleChat(baseURL, apiKey, model, prompt string, caveman bool) {
 	if err != nil {
 		fmt.Printf("  Error: %v\n", err)
 		return
+	}
+	if result.Routing != nil {
+		printRoutingDecision(result.Routing)
 	}
 	fmt.Printf("\n%s %s\n", bold(cyan("Nexus:")), result.Content)
 	printResponseMeta(result, model)
