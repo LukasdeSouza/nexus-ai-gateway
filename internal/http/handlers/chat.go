@@ -1,9 +1,8 @@
-﻿// Package handlers contains HTTP request handlers.
+// Package handlers contains HTTP request handlers.
 package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -36,7 +35,7 @@ type RequestRecordStore interface {
 	Create(ctx context.Context, record *domain.RequestRecord) error
 }
 
-// ChatHandler handles POST /v1/chat/completions.
+// ChatHandler handles POST /v1/chat/completions with automatic fallback & failover across models.
 type ChatHandler struct {
 	validator        *auth.Validator
 	tenantResolver   *tenant.Resolver
@@ -100,7 +99,7 @@ type messageRequest struct {
 	Content string `json:"content"`
 }
 
-// ServeHTTP handles the chat completions endpoint.
+// ServeHTTP handles the chat completions endpoint with transparent fallback failovers.
 func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":{"message":"method not allowed","code":"method_not_allowed"}}`, http.StatusMethodNotAllowed)
@@ -218,139 +217,113 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 7. Resolve routing policy
 	policy, err := h.policyStore.GetActiveByProject(ctx, tc.Project.ID)
 	if err != nil {
-		log.Warn("no active routing policy, using first registered provider", zap.Error(err))
+		log.Warn("no active routing policy, using dynamic multi-tier fallback plan", zap.Error(err))
 	}
 
-	// 8. Select provider via Routing Engine
-	selectedProvider, decision, err := h.routingEngine.Route(provReq, policy)
+	// 8. Build Route Plan with Candidate Chain
+	plan, err := h.routingEngine.RoutePlan(provReq, policy)
 	if err != nil {
 		writeError(w, requestID, err)
 		return
 	}
 
-	// Set decision headers on response for client observability
-	w.Header().Set("X-Nexus-Route-Model", decision.SelectedModel)
-	w.Header().Set("X-Nexus-Route-Provider", decision.ProviderID)
-	w.Header().Set("X-Nexus-Route-Tier", decision.Tier)
-	w.Header().Set("X-Nexus-Route-Complexity", fmt.Sprintf("%.2f", decision.Complexity))
-	w.Header().Set("X-Nexus-Route-Intent", decision.Intent)
-	w.Header().Set("X-Nexus-Route-Rationale", decision.Rationale)
+	// 9. Execute with failover chain
+	start := time.Now()
+	var lastErr error
+	var successfulResp *provider.ChatResponse
+	var successfulCandidate *routing.Candidate
 
-	// 9. Create request record
+	for i, cand := range plan.Candidates {
+		provReq.Model = cand.Model
+		log.Info("attempting model execution",
+			zap.String("model", cand.Model),
+			zap.String("provider", cand.ProviderID),
+			zap.Int("candidate_index", i),
+		)
+
+		resp, err := cand.Provider.Chat(ctx, provReq)
+		if err == nil && resp != nil {
+			successfulResp = resp
+			successfulCandidate = &cand
+			plan.SelectedModel = cand.Model
+			plan.ProviderID = cand.ProviderID
+			if i > 0 {
+				plan.RedirectSummary = fmt.Sprintf("Redirected to %s (%s) after %d failed attempt(s)", cand.Model, cand.ProviderID, i)
+			}
+			break
+		}
+
+		// Record failed attempt in fallback trace
+		errMsg := err.Error()
+		log.Warn("candidate execution failed, triggering failover",
+			zap.String("failed_model", cand.Model),
+			zap.String("provider", cand.ProviderID),
+			zap.Error(err),
+		)
+
+		plan.FallbackTrace = append(plan.FallbackTrace, routing.FallbackAttempt{
+			Model:      cand.Model,
+			ProviderID: cand.ProviderID,
+			Tier:       cand.Tier,
+			Error:      errMsg,
+			Reason:     fmt.Sprintf("Provider call returned error, redirecting to next available candidate in pool"),
+		})
+		lastErr = err
+		h.metrics.ProviderFallbackTotal.WithLabelValues(cand.ProviderID, "fallback").Inc()
+	}
+
+	latencyMS := time.Since(start).Milliseconds()
+
+	// If all candidates failed
+	if successfulResp == nil {
+		record := domain.NewRequestRecord(requestID, tc.Project.ID)
+		record.Fail(domain.CodeOf(lastErr), latencyMS)
+		h.saveAndEmit(ctx, record, tc.Project.ID)
+		writeError(w, requestID, lastErr)
+		return
+	}
+
+	// 10. Record metrics and complete audit record
 	record := domain.NewRequestRecord(requestID, tc.Project.ID)
 	if policy != nil {
 		record.RoutingStrategy = policy.Strategy
 	}
-
-	// 10. Execute request
-	provReq.Model = decision.SelectedModel
-	start := time.Now()
-
-	if reqBody.Stream {
-		h.handleStream(w, r, ctx, selectedProvider, decision.SelectedModel, provReq, record, start, requestID, tc.Project.ID, decision)
-		return
-	}
-
-	resp, err := selectedProvider.Chat(ctx, provReq)
-	latencyMS := time.Since(start).Milliseconds()
-
-	if err != nil {
-		record.Fail(domain.CodeOf(err), latencyMS)
-		h.saveAndEmit(ctx, record, tc.Project.ID)
-		h.metrics.ProviderRequestsTotal.WithLabelValues(selectedProvider.ID(), decision.SelectedModel, "error").Inc()
-		writeError(w, requestID, err)
-		return
-	}
-
-	// 11. Record metrics and complete the record
-	cost := estimateCost(decision.SelectedModel, resp.Usage)
-	record.Complete(domain.ProviderID(selectedProvider.ID()), decision.SelectedModel, domain.TokenUsage{
-		InputTokens:  resp.Usage.InputTokens,
-		OutputTokens: resp.Usage.OutputTokens,
-		TotalTokens:  resp.Usage.TotalTokens,
+	cost := estimateCost(successfulCandidate.Model, successfulResp.Usage)
+	record.Complete(domain.ProviderID(successfulCandidate.ProviderID), successfulCandidate.Model, domain.TokenUsage{
+		InputTokens:  successfulResp.Usage.InputTokens,
+		OutputTokens: successfulResp.Usage.OutputTokens,
+		TotalTokens:  successfulResp.Usage.TotalTokens,
 	}, latencyMS, cost)
 
-	h.metrics.ProviderRequestsTotal.WithLabelValues(selectedProvider.ID(), decision.SelectedModel, "success").Inc()
-	h.metrics.ProviderRequestDuration.WithLabelValues(selectedProvider.ID(), decision.SelectedModel).Observe(float64(latencyMS) / 1000)
-	h.metrics.LLMTokensTotal.WithLabelValues("input", selectedProvider.ID(), decision.SelectedModel).Add(float64(resp.Usage.InputTokens))
-	h.metrics.LLMTokensTotal.WithLabelValues("output", selectedProvider.ID(), decision.SelectedModel).Add(float64(resp.Usage.OutputTokens))
+	if len(plan.FallbackTrace) > 0 {
+		record.FallbackUsed = true
+		record.RetryCount = len(plan.FallbackTrace)
+	}
 
-	// 12. Save record and emit usage event asynchronously
+	h.metrics.ProviderRequestsTotal.WithLabelValues(successfulCandidate.ProviderID, successfulCandidate.Model, "success").Inc()
+	h.metrics.ProviderRequestDuration.WithLabelValues(successfulCandidate.ProviderID, successfulCandidate.Model).Observe(float64(latencyMS) / 1000)
+	h.metrics.LLMTokensTotal.WithLabelValues("input", successfulCandidate.ProviderID, successfulCandidate.Model).Add(float64(successfulResp.Usage.InputTokens))
+	h.metrics.LLMTokensTotal.WithLabelValues("output", successfulCandidate.ProviderID, successfulCandidate.Model).Add(float64(successfulResp.Usage.OutputTokens))
+
+	// 11. Set response headers
+	w.Header().Set("X-Nexus-Route-Model", plan.SelectedModel)
+	w.Header().Set("X-Nexus-Route-Provider", plan.ProviderID)
+	w.Header().Set("X-Nexus-Route-Tier", plan.Tier)
+	w.Header().Set("X-Nexus-Route-Complexity", fmt.Sprintf("%.2f", plan.Complexity))
+	w.Header().Set("X-Nexus-Route-Intent", plan.Intent)
+	w.Header().Set("X-Nexus-Route-Rationale", plan.Rationale)
+	if len(plan.FallbackTrace) > 0 {
+		w.Header().Set("X-Nexus-Fallback-Count", fmt.Sprintf("%d", len(plan.FallbackTrace)))
+		w.Header().Set("X-Nexus-Redirect-Summary", plan.RedirectSummary)
+	}
+
+	// 12. Save record asynchronously
 	h.saveAndEmit(ctx, record, tc.Project.ID)
 
-	// 13. Respond — OpenAI-compatible shape with nexus routing metadata
-	writeJSON(w, http.StatusOK, toOpenAIResponse(resp, requestID, decision))
+	// 13. Write response
+	writeJSON(w, http.StatusOK, toOpenAIResponse(successfulResp, requestID, plan))
 }
 
-// handleStream writes an SSE streaming response.
-func (h *ChatHandler) handleStream(
-	w http.ResponseWriter, r *http.Request, ctx context.Context,
-	prov provider.Provider, model string, req *provider.ChatRequest,
-	record *domain.RequestRecord, start time.Time,
-	requestID, projectID string, decision *routing.Decision,
-) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Request-ID", requestID)
-	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, requestID, domain.New(domain.CodeInternal, "streaming unsupported by transport"))
-		return
-	}
-
-	chunkCh, err := prov.StreamChat(ctx, req)
-	if err != nil {
-		record.Fail(domain.CodeOf(err), time.Since(start).Milliseconds())
-		h.saveAndEmit(ctx, record, projectID)
-		h.metrics.ProviderRequestsTotal.WithLabelValues(prov.ID(), model, "error").Inc()
-		errObj := map[string]interface{}{"error": map[string]string{"message": err.Error(), "code": string(domain.CodeOf(err))}}
-		data, _ := json.Marshal(errObj)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
-		return
-	}
-
-	var finalUsage *provider.TokenUsage
-	for chunk := range chunkCh {
-		if chunk.Err != nil {
-			h.logger.Warn("stream chunk error", zap.Error(chunk.Err), zap.String("request_id", requestID))
-			break
-		}
-		if chunk.Usage != nil {
-			finalUsage = chunk.Usage
-		}
-
-		data, err := marshalSSEChunk(chunk, requestID)
-		if err != nil {
-			h.logger.Warn("failed to marshal chunk", zap.Error(err))
-			continue
-		}
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
-	}
-
-	_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-
-	latencyMS := time.Since(start).Milliseconds()
-	if finalUsage != nil {
-		cost := estimateCost(model, *finalUsage)
-		record.Complete(domain.ProviderID(prov.ID()), model, domain.TokenUsage{
-			InputTokens:  finalUsage.InputTokens,
-			OutputTokens: finalUsage.OutputTokens,
-			TotalTokens:  finalUsage.TotalTokens,
-		}, latencyMS, cost)
-	} else {
-		record.Complete(domain.ProviderID(prov.ID()), model, domain.TokenUsage{}, latencyMS, 0)
-	}
-
-	h.saveAndEmit(ctx, record, projectID)
-}
-
-// saveAndEmit persists the request record and emits a usage event.
 func (h *ChatHandler) saveAndEmit(ctx context.Context, record *domain.RequestRecord, projectID string) {
 	go func() {
 		bgCtx := context.Background()
@@ -398,7 +371,7 @@ func toOpenAIResponse(resp *provider.ChatResponse, requestID string, decision *r
 	}
 
 	if decision != nil {
-		res["nexus_routing"] = map[string]interface{}{
+		routingMap := map[string]interface{}{
 			"requested_model":  decision.RequestedModel,
 			"selected_model":   decision.SelectedModel,
 			"provider":         decision.ProviderID,
@@ -408,35 +381,14 @@ func toOpenAIResponse(resp *provider.ChatResponse, requestID string, decision *r
 			"rationale":        decision.Rationale,
 			"context_chars":    decision.ContextChars,
 		}
+		if len(decision.FallbackTrace) > 0 {
+			routingMap["fallback_trace"] = decision.FallbackTrace
+			routingMap["redirect_summary"] = decision.RedirectSummary
+		}
+		res["nexus_routing"] = routingMap
 	}
 
 	return res
-}
-
-func marshalSSEChunk(chunk provider.ChatChunk, requestID string) ([]byte, error) {
-	choices := make([]map[string]interface{}, 0, len(chunk.Choices))
-	for _, c := range chunk.Choices {
-		choices = append(choices, map[string]interface{}{
-			"index":         c.Index,
-			"delta":         map[string]string{"role": c.Delta.Role, "content": c.Delta.Content},
-			"finish_reason": nilIfEmpty(c.FinishReason),
-		})
-	}
-	obj := map[string]interface{}{
-		"id":      chunk.ID,
-		"object":  "chat.completion.chunk",
-		"created": chunk.Created,
-		"model":   chunk.Model,
-		"choices": choices,
-	}
-	return json.Marshal(obj)
-}
-
-func nilIfEmpty(s string) interface{} {
-	if s == "" {
-		return nil
-	}
-	return s
 }
 
 func estimateCost(model string, usage provider.TokenUsage) float64 {

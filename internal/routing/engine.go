@@ -9,19 +9,39 @@ import (
 	"github.com/LukasdeSouza/nexus-ai-gateway/internal/provider"
 )
 
-// Decision holds the complete routing metadata and thought process.
-type Decision struct {
-	RequestedModel string  `json:"requested_model"`
-	SelectedModel  string  `json:"selected_model"`
-	ProviderID     string  `json:"provider_id"`
-	Tier           string  `json:"tier"` // "fast" | "smart"
-	Complexity     float64 `json:"complexity_score"` // 0.0 to 1.0
-	Intent         string  `json:"intent"`
-	Rationale      string  `json:"rationale"`
-	ContextChars   int     `json:"context_chars"`
+// Candidate represents a candidate model to try in sequence.
+type Candidate struct {
+	Provider   provider.Provider `json:"-"`
+	ProviderID string            `json:"provider_id"`
+	Model      string            `json:"model"`
+	Tier       string            `json:"tier"` // "primary" | "same-tier-fallback" | "cross-tier-fallback"
 }
 
-// Engine evaluates chat messages and selects optimal models and providers.
+// FallbackAttempt records an attempt and why it failed before redirecting.
+type FallbackAttempt struct {
+	Model      string `json:"model"`
+	ProviderID string `json:"provider_id"`
+	Tier       string `json:"tier"`
+	Error      string `json:"error"`
+	Reason     string `json:"reason"`
+}
+
+// Decision holds the complete routing metadata, thought process, and any fallback trace.
+type Decision struct {
+	RequestedModel  string            `json:"requested_model"`
+	SelectedModel   string            `json:"selected_model"`
+	ProviderID      string            `json:"provider_id"`
+	Tier            string            `json:"tier"`
+	Complexity      float64           `json:"complexity_score"`
+	Intent          string            `json:"intent"`
+	Rationale       string            `json:"rationale"`
+	ContextChars    int               `json:"context_chars"`
+	Candidates      []Candidate       `json:"-"`
+	FallbackTrace   []FallbackAttempt `json:"fallback_trace,omitempty"`
+	RedirectSummary string            `json:"redirect_summary,omitempty"`
+}
+
+// Engine evaluates chat messages and builds prioritized candidate chains for resilient execution.
 type Engine struct {
 	providerReg *provider.Registry
 }
@@ -33,27 +53,47 @@ func NewEngine(reg *provider.Registry) *Engine {
 	}
 }
 
-// Route determines the best provider and model for a request, returning full decision metadata.
-func (e *Engine) Route(req *provider.ChatRequest, policy *domain.RoutingPolicy) (provider.Provider, *Decision, error) {
+// RoutePlan builds a prioritized candidate chain and initial decision for the request.
+func (e *Engine) RoutePlan(req *provider.ChatRequest, policy *domain.RoutingPolicy) (*Decision, error) {
 	all := e.providerReg.All()
 	if len(all) == 0 {
-		return nil, nil, domain.New(domain.CodeProviderUnavailable, "no providers registered")
+		return nil, domain.New(domain.CodeProviderUnavailable, "no providers registered")
 	}
 
+	// Active providers
+	geminiProv, hasGemini := e.providerReg.Get("gemini")
+	openaiProv, hasOpenAI := e.providerReg.Get("openai")
+	anthropicProv, hasAnthropic := e.providerReg.Get("anthropic")
+
+	// Custom project routing policy if defined
 	if policy != nil && len(policy.Candidates) > 0 {
-		c := policy.Candidates[0]
-		if p, ok := e.providerReg.Get(string(c.Provider)); ok {
-			d := &Decision{
+		var candidates []Candidate
+		for i, c := range policy.Candidates {
+			if p, ok := e.providerReg.Get(string(c.Provider)); ok {
+				tier := "primary"
+				if i > 0 {
+					tier = "policy-fallback"
+				}
+				candidates = append(candidates, Candidate{
+					Provider:   p,
+					ProviderID: string(c.Provider),
+					Model:      c.Model,
+					Tier:       tier,
+				})
+			}
+		}
+		if len(candidates) > 0 {
+			return &Decision{
 				RequestedModel: req.Model,
-				SelectedModel:  c.Model,
-				ProviderID:     string(c.Provider),
+				SelectedModel:  candidates[0].Model,
+				ProviderID:     candidates[0].ProviderID,
 				Tier:           "custom-policy",
 				Complexity:     0.5,
 				Intent:         "Custom Project Policy",
-				Rationale:      fmt.Sprintf("Explicit project policy matched: candidate priority %d", c.Priority),
+				Rationale:      fmt.Sprintf("Policy defined with %d failover candidates", len(candidates)),
 				ContextChars:   countChars(req.Messages),
-			}
-			return p, d, nil
+				Candidates:     candidates,
+			}, nil
 		}
 	}
 
@@ -62,139 +102,151 @@ func (e *Engine) Route(req *provider.ChatRequest, policy *domain.RoutingPolicy) 
 		model = "auto"
 	}
 
-	_, hasGemini := e.providerReg.Get("gemini")
-	_, hasOpenAI := e.providerReg.Get("openai")
-	_, hasAnthropic := e.providerReg.Get("anthropic")
-
-	pickFastTier := func() (provider.Provider, string, string) {
-		if hasGemini {
-			p, _ := e.providerReg.Get("gemini")
-			return p, "gemini-3.6-flash", "gemini"
-		}
-		if hasOpenAI {
-			p, _ := e.providerReg.Get("openai")
-			return p, "gpt-4o-mini", "openai"
-		}
-		if hasAnthropic {
-			p, _ := e.providerReg.Get("anthropic")
-			return p, "claude-3-haiku-20240307", "anthropic"
-		}
-		return all[0], "gemini-3.6-flash", all[0].ID()
+	// Model pools
+	var fastPool []Candidate
+	if hasGemini {
+		fastPool = append(fastPool, Candidate{Provider: geminiProv, ProviderID: "gemini", Model: "gemini-3.6-flash", Tier: "fast"})
+	}
+	if hasOpenAI {
+		fastPool = append(fastPool, Candidate{Provider: openaiProv, ProviderID: "openai", Model: "gpt-4o-mini", Tier: "fast"})
+	}
+	if hasAnthropic {
+		fastPool = append(fastPool, Candidate{Provider: anthropicProv, ProviderID: "anthropic", Model: "claude-3-haiku-20240307", Tier: "fast"})
 	}
 
-	pickSmartTier := func() (provider.Provider, string, string) {
-		if hasOpenAI {
-			p, _ := e.providerReg.Get("openai")
-			return p, "gpt-4o", "openai"
-		}
-		if hasAnthropic {
-			p, _ := e.providerReg.Get("anthropic")
-			return p, "claude-3-5-sonnet-20241022", "anthropic"
-		}
-		if hasGemini {
-			p, _ := e.providerReg.Get("gemini")
-			return p, "gemini-2.5-pro", "gemini"
-		}
-		return all[0], "gpt-4o", all[0].ID()
+	var smartPool []Candidate
+	if hasOpenAI {
+		smartPool = append(smartPool, Candidate{Provider: openaiProv, ProviderID: "openai", Model: "gpt-4o", Tier: "smart"})
+	}
+	if hasAnthropic {
+		smartPool = append(smartPool, Candidate{Provider: anthropicProv, ProviderID: "anthropic", Model: "claude-3-5-sonnet-20241022", Tier: "smart"})
+	}
+	if hasGemini {
+		smartPool = append(smartPool, Candidate{Provider: geminiProv, ProviderID: "gemini", Model: "gemini-2.5-pro", Tier: "smart"})
 	}
 
-	var prov provider.Provider
-	var chosenModel string
-	var chosenProviderID string
-	var tier string
+	ctxChars := countChars(req.Messages)
+	var candidates []Candidate
+	var initialTier string
 	var complexity float64
 	var intent string
 	var rationale string
-
-	ctxChars := countChars(req.Messages)
 
 	switch {
 	case model == "auto":
 		complexity, intent, rationale = analyzeComplexity(req.Messages)
 		if complexity >= 0.5 {
-			tier = "smart"
-			prov, chosenModel, chosenProviderID = pickSmartTier()
+			initialTier = "smart"
+			// Start with smart candidates, failover to remaining smart, then cross-tier to fast
+			candidates = append(candidates, smartPool...)
+			candidates = append(candidates, fastPool...)
 		} else {
-			tier = "fast"
-			prov, chosenModel, chosenProviderID = pickFastTier()
+			initialTier = "fast"
+			// Start with fast candidates, failover to remaining fast, then cross-tier to smart
+			candidates = append(candidates, fastPool...)
+			candidates = append(candidates, smartPool...)
 		}
 
 	case model == "cheap" || model == "fast":
-		tier = "fast"
+		initialTier = "fast"
 		complexity = 0.2
 		intent = "Explicit Tier Selection"
 		rationale = "User requested fast/cheap tier execution"
-		prov, chosenModel, chosenProviderID = pickFastTier()
+		candidates = append(candidates, fastPool...)
+		candidates = append(candidates, smartPool...) // cross-tier safety net
 
 	case model == "smart" || model == "quality":
-		tier = "smart"
+		initialTier = "smart"
 		complexity = 0.8
 		intent = "Explicit Tier Selection"
 		rationale = "User requested smart/quality tier execution"
-		prov, chosenModel, chosenProviderID = pickSmartTier()
+		candidates = append(candidates, smartPool...)
+		candidates = append(candidates, fastPool...) // cross-tier safety net
 
 	case strings.HasPrefix(model, "claude-"):
-		tier = "explicit-model"
+		initialTier = "explicit-model"
 		complexity = 0.7
 		intent = "Specific Model Pinning"
 		rationale = "User pinned Anthropic Claude model family"
-		prov, _ = e.providerReg.Get("anthropic")
-		chosenModel = model
-		chosenProviderID = "anthropic"
+		if hasAnthropic {
+			candidates = append(candidates, Candidate{Provider: anthropicProv, ProviderID: "anthropic", Model: model, Tier: "primary"})
+		}
+		// Fallbacks
+		candidates = append(candidates, smartPool...)
+		candidates = append(candidates, fastPool...)
 
 	case strings.HasPrefix(model, "gemini-"):
-		tier = "explicit-model"
+		initialTier = "explicit-model"
 		complexity = 0.3
 		intent = "Specific Model Pinning"
 		rationale = "User pinned Google Gemini model family"
-		prov, _ = e.providerReg.Get("gemini")
-		chosenModel = model
-		chosenProviderID = "gemini"
+		if hasGemini {
+			candidates = append(candidates, Candidate{Provider: geminiProv, ProviderID: "gemini", Model: model, Tier: "primary"})
+		}
+		// Fallbacks
+		candidates = append(candidates, fastPool...)
+		candidates = append(candidates, smartPool...)
 
 	case strings.HasPrefix(model, "gpt-"):
-		tier = "explicit-model"
+		initialTier = "explicit-model"
 		complexity = 0.7
 		intent = "Specific Model Pinning"
 		rationale = "User pinned OpenAI GPT model family"
-		prov, _ = e.providerReg.Get("openai")
-		chosenModel = model
-		chosenProviderID = "openai"
+		if hasOpenAI {
+			candidates = append(candidates, Candidate{Provider: openaiProv, ProviderID: "openai", Model: model, Tier: "primary"})
+		}
+		// Fallbacks
+		candidates = append(candidates, smartPool...)
+		candidates = append(candidates, fastPool...)
 
 	default:
 		if p, ok := e.providerReg.Get(model); ok {
-			prov = p
-			chosenModel = model
-			chosenProviderID = model
-			tier = "explicit-provider"
-			complexity = 0.5
-			intent = "Explicit Provider Selection"
-			rationale = "Provider selected by direct identifier"
-		} else {
-			tier = "fallback-fast"
-			complexity = 0.2
-			intent = "Fallback Routing"
-			rationale = "Unknown model identifier, falling back to active fast tier"
-			prov, chosenModel, chosenProviderID = pickFastTier()
+			candidates = append(candidates, Candidate{Provider: p, ProviderID: model, Model: model, Tier: "primary"})
 		}
+		candidates = append(candidates, fastPool...)
+		candidates = append(candidates, smartPool...)
+		initialTier = "fallback-fast"
+		complexity = 0.2
+		intent = "Custom / Fallback Routing"
+		rationale = "Routing through registered models"
 	}
 
-	if prov == nil {
-		prov = all[0]
-		chosenProviderID = all[0].ID()
+	// Deduplicate candidates
+	candidates = deduplicateCandidates(candidates)
+
+	if len(candidates) == 0 {
+		candidates = append(candidates, Candidate{
+			Provider:   all[0],
+			ProviderID: all[0].ID(),
+			Model:      "gemini-3.6-flash",
+			Tier:       "fallback",
+		})
 	}
 
-	decision := &Decision{
+	return &Decision{
 		RequestedModel: model,
-		SelectedModel:  chosenModel,
-		ProviderID:     chosenProviderID,
-		Tier:           tier,
+		SelectedModel:  candidates[0].Model,
+		ProviderID:     candidates[0].ProviderID,
+		Tier:           initialTier,
 		Complexity:     complexity,
 		Intent:         intent,
 		Rationale:      rationale,
 		ContextChars:   ctxChars,
-	}
+		Candidates:     candidates,
+	}, nil
+}
 
-	return prov, decision, nil
+func deduplicateCandidates(list []Candidate) []Candidate {
+	seen := make(map[string]bool)
+	var res []Candidate
+	for _, c := range list {
+		key := c.ProviderID + ":" + c.Model
+		if !seen[key] {
+			seen[key] = true
+			res = append(res, c)
+		}
+	}
+	return res
 }
 
 func countChars(messages []provider.Message) int {
@@ -221,7 +273,6 @@ func analyzeComplexity(messages []provider.Message) (score float64, intent strin
 
 	lower := strings.ToLower(lastUserContent)
 
-	// Tier 1 High Complexity matches
 	heavyKeywords := map[string]string{
 		"refactor":                "Code Refactoring & Architecture",
 		"architecture":            "System Architecture Design",
@@ -248,17 +299,14 @@ func analyzeComplexity(messages []provider.Message) (score float64, intent strin
 		}
 	}
 
-	// Code block or dense syntax detection
 	if strings.Contains(lastUserContent, "```") || strings.Contains(lastUserContent, "func ") || strings.Contains(lastUserContent, "class ") || strings.Contains(lastUserContent, "struct ") {
 		return 0.75, "Source Code Analysis", "Embedded source code or structured syntax block detected"
 	}
 
-	// Large context
 	if totalLen > 3500 {
 		return 0.70, "Large Context Analysis", fmt.Sprintf("Long conversation history (%d characters)", totalLen)
 	}
 
-	// Conversational / simple tasks
 	conversationalKeywords := []string{
 		"hi", "hello", "hey", "olá", "ola", "bom dia", "boa tarde", "boa noite",
 		"ok", "yes", "no", "sim", "não", "nao", "thanks", "obrigado", "valeu",

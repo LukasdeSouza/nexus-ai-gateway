@@ -161,17 +161,27 @@ type Credentials struct {
 	ProjectID string `json:"project_id,omitempty"`
 }
 
-// RoutingMeta holds gateway decision metadata
+// FallbackAttemptTrace records a model failure before redirect
+type FallbackAttemptTrace struct {
+	Model      string `json:"model"`
+	ProviderID string `json:"provider_id"`
+	Tier       string `json:"tier"`
+	Error      string `json:"error"`
+	Reason     string `json:"reason"`
+}
 
+// RoutingMeta holds gateway decision metadata and fallback trace
 type RoutingMeta struct {
-	RequestedModel  string  `json:"requested_model"`
-	SelectedModel   string  `json:"selected_model"`
-	Provider        string  `json:"provider"`
-	Tier            string  `json:"tier"`
-	ComplexityScore float64 `json:"complexity_score"`
-	Intent          string  `json:"intent"`
-	Rationale       string  `json:"rationale"`
-	ContextChars    int     `json:"context_chars"`
+	RequestedModel  string                 `json:"requested_model"`
+	SelectedModel   string                 `json:"selected_model"`
+	Provider        string                 `json:"provider"`
+	Tier            string                 `json:"tier"`
+	ComplexityScore float64                `json:"complexity_score"`
+	Intent          string                 `json:"intent"`
+	Rationale       string                 `json:"rationale"`
+	ContextChars    int                    `json:"context_chars"`
+	FallbackTrace   []FallbackAttemptTrace `json:"fallback_trace,omitempty"`
+	RedirectSummary string                 `json:"redirect_summary,omitempty"`
 }
 
 // ChatResult
@@ -489,7 +499,7 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 
 		history = append(history, map[string]string{"role": "assistant", "content": result.Content})
 
-		// Print Routing Thought Process
+		// Print Routing Thought Process & Fallback Redirection Traces
 		if result.Routing != nil {
 			printRoutingDecision(result.Routing)
 		}
@@ -504,11 +514,37 @@ func printRoutingDecision(r *RoutingMeta) {
 	fmt.Printf("  %s\n", bold("[Nexus Routing Engine]"))
 	fmt.Printf("  |- Intent detected: %s %s\n", cyan(r.Intent), dim(fmt.Sprintf("(score: %.2f)", r.ComplexityScore)))
 	fmt.Printf("  |- Rationale:       %s\n", dim(r.Rationale))
-	fmt.Printf("  |- Decision:        %s -> %s (%s)\n",
-		yellow("["+r.Tier+"]"),
-		bold(r.SelectedModel),
-		r.Provider,
-	)
+
+	if len(r.FallbackTrace) > 0 {
+		for i, fb := range r.FallbackTrace {
+			fmt.Printf("  |- %s Model attempt [%s] -> %s (%s) failed\n",
+				red(fmt.Sprintf("Failover #%d:", i+1)),
+				fb.Tier,
+				bold(fb.Model),
+				fb.ProviderID,
+			)
+			fmt.Printf("  |  * Error:  %s\n", red(truncateStr(fb.Error, 85)))
+			fmt.Printf("  |  * Action: %s\n", yellow(fb.Reason))
+		}
+		fmt.Printf("  |- Decision:        %s -> %s (%s) [Resolved via Fallback]\n",
+			green("["+r.Tier+"]"),
+			bold(green(r.SelectedModel)),
+			r.Provider,
+		)
+	} else {
+		fmt.Printf("  |- Decision:        %s -> %s (%s)\n",
+			yellow("["+r.Tier+"]"),
+			bold(r.SelectedModel),
+			r.Provider,
+		)
+	}
+}
+
+func truncateStr(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 func printBanner(model, baseURL, projectID string, caveman bool) {
