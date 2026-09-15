@@ -1,4 +1,4 @@
-// Package handlers contains HTTP request handlers.
+﻿// Package handlers contains HTTP request handlers.
 package handlers
 
 import (
@@ -35,7 +35,7 @@ type RequestRecordStore interface {
 	Create(ctx context.Context, record *domain.RequestRecord) error
 }
 
-// ChatHandler handles POST /v1/chat/completions with automatic fallback & failover across models.
+// ChatHandler handles POST /v1/chat/completions with coding agent instructions and failover.
 type ChatHandler struct {
 	validator        *auth.Validator
 	tenantResolver   *tenant.Resolver
@@ -98,6 +98,17 @@ type messageRequest struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
+
+const codingAgentSystemPrompt = `You are Nexus, an elite AI coding assistant and agent.
+When the user asks you to modify, edit, or create files, output your proposed changes using the exact block formats below so the Nexus CLI can inspect diffs and apply them safely to disk:
+
+1. To edit an existing file with surgical precision (Search/Replace):
+` + "```edit:path/to/file.ext\n<<<<<<< SEARCH\nexact original code snippet to replace\n=======\nexact new code snippet\n>>>>>>> REPLACE\n```" + `
+
+2. To create a new file or completely overwrite an existing file:
+` + "```write:path/to/file.ext\ncomplete file contents\n```" + `
+
+Be direct, precise, and concise. Ensure SEARCH blocks match the target file character-for-character.`
 
 // ServeHTTP handles the chat completions endpoint with transparent fallback failovers.
 func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +174,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Build provider request
+	// 6. Build provider request with Coding Agent System Prompt
 	provReq := &provider.ChatRequest{
 		Model:       reqBody.Model,
 		Stream:      reqBody.Stream,
@@ -185,33 +196,28 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cavemanEnabled = false
 	}
 
+	systemDirective := codingAgentSystemPrompt
 	if cavemanEnabled {
-		cavemanPrompt := "Respond directly and concisely. No fluff, no filler, no introductory pleasantries, no conversational padding. Optimize for brevity and token savings."
-		hasSystem := false
-		for _, m := range reqBody.Messages {
-			if strings.ToLower(m.Role) == "system" {
-				provReq.Messages = append(provReq.Messages, provider.Message{
-					Role:    m.Role,
-					Content: m.Content + "\n" + cavemanPrompt,
-				})
-				hasSystem = true
-			} else {
-				provReq.Messages = append(provReq.Messages, provider.Message{
-					Role:    m.Role,
-					Content: m.Content,
-				})
-			}
-		}
-		if !hasSystem {
-			provReq.Messages = append([]provider.Message{{Role: "system", Content: cavemanPrompt}}, provReq.Messages...)
-		}
-	} else {
-		for _, m := range reqBody.Messages {
+		systemDirective += "\nRespond directly and concisely. No fluff, no filler, no pleasantries. Optimize for brevity and token savings."
+	}
+
+	hasSystem := false
+	for _, m := range reqBody.Messages {
+		if strings.ToLower(m.Role) == "system" {
+			provReq.Messages = append(provReq.Messages, provider.Message{
+				Role:    m.Role,
+				Content: m.Content + "\n" + systemDirective,
+			})
+			hasSystem = true
+		} else {
 			provReq.Messages = append(provReq.Messages, provider.Message{
 				Role:    m.Role,
 				Content: m.Content,
 			})
 		}
+	}
+	if !hasSystem {
+		provReq.Messages = append([]provider.Message{{Role: "system", Content: systemDirective}}, provReq.Messages...)
 	}
 
 	// 7. Resolve routing policy
@@ -266,7 +272,7 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ProviderID: cand.ProviderID,
 			Tier:       cand.Tier,
 			Error:      errMsg,
-			Reason:     fmt.Sprintf("Provider call returned error, redirecting to next available candidate in pool"),
+			Reason:     "Provider call returned error, redirecting to next available candidate in pool",
 		})
 		lastErr = err
 		h.metrics.ProviderFallbackTotal.WithLabelValues(cand.ProviderID, "fallback").Inc()

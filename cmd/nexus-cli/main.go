@@ -1,4 +1,4 @@
-﻿// Command nexus-cli provides terminal administration, diagnostics, and an interactive chat REPL for Nexus AI Gateway.
+// Command nexus-cli provides terminal administration, diagnostics, and an interactive chat REPL for Nexus AI Gateway.
 package main
 
 import (
@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chzyer/readline"
 )
 
 // ANSI color helpers
@@ -378,24 +380,36 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 	}
 
 	caveman := true
+	autoApply := false
 	stats := newSessionStats()
 	var history []map[string]string
 
-	printBanner(model, baseURL, creds.ProjectID, caveman)
+	printBanner(model, baseURL, creds.ProjectID, caveman, autoApply)
 
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	home, _ := os.UserHomeDir()
+	historyFile := filepath.Join(home, ".nexus", "chat_history")
+	_ = os.MkdirAll(filepath.Dir(historyFile), 0700)
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          buildPrompt(caveman, autoApply, model),
+		HistoryFile:     historyFile,
+		AutoComplete:    NewNexusCompleter(),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		fmt.Printf("Terminal readline error: %v\n", err)
+		return
+	}
+	defer rl.Close()
 
 	for {
-		cavemanTag := ""
-		if caveman {
-			cavemanTag = green("[caveman]") + " "
-		}
-		fmt.Printf("%s %s[%s] > ", cyan("nexus"), cavemanTag, yellow(model))
-		if !scanner.Scan() {
+		rl.SetPrompt(buildPrompt(caveman, autoApply, model))
+		line, err := rl.Readline()
+		if err != nil {
 			break
 		}
-		input := strings.TrimSpace(scanner.Text())
+		input := strings.TrimSpace(line)
 		if input == "" {
 			continue
 		}
@@ -442,6 +456,24 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 					}
 				}
 
+			case "/auto-apply", "/autowrite", "/auto":
+				if len(parts) < 2 {
+					status := "DISABLED (requires manual [Y/n] confirmation for every change)"
+					if autoApply {
+						status = "ENABLED (AI automatically writes and patches files without prompting)"
+					}
+					fmt.Printf("  Auto-Apply is currently: %s\n  Use: /auto-apply on | /auto-apply off\n\n", bold(status))
+				} else {
+					arg := strings.ToLower(parts[1])
+					if arg == "on" || arg == "true" || arg == "1" {
+						autoApply = true
+						fmt.Printf("  %s Auto-Apply Mode ENABLED: proposed code edits will be written automatically.\n\n", yellow("WARNING:"))
+					} else {
+						autoApply = false
+						fmt.Printf("  %s Auto-Apply Mode DISABLED: manual confirmation [Y/n] will be requested for all changes.\n\n", green("OK"))
+					}
+				}
+
 			case "/models":
 				listModels(baseURL, apiKey)
 
@@ -480,7 +512,20 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 			continue
 		}
 
-		history = append(history, map[string]string{"role": "user", "content": input})
+		// 1. Expand any @file or @dir mentions in input
+		expandedInput, contextItems, contextErrs := ExpandPromptContext(input)
+		for _, err := range contextErrs {
+			fmt.Printf("  %s %v\n", yellow("[Context Notice]"), err)
+		}
+		if len(contextItems) > 0 {
+			var loadedNames []string
+			for _, item := range contextItems {
+				loadedNames = append(loadedNames, filepath.ToSlash(item.Path))
+			}
+			fmt.Printf("  %s Loaded file context: %s\n", green("->"), cyan(strings.Join(loadedNames, ", ")))
+		}
+
+		history = append(history, map[string]string{"role": "user", "content": expandedInput})
 
 		spinner := newSpinner("Nexus is analyzing and routing...")
 		spinner.Start()
@@ -506,6 +551,18 @@ func startInteractiveChat(baseURL, apiKey, initialModel string, creds Credential
 
 		fmt.Printf("\n%s %s\n", bold(cyan("Nexus:")), result.Content)
 		printResponseMeta(result, model)
+
+		// 2. Parse any proposed code modifications (Search/Replace or Write blocks)
+		proposedEdits := ParseProposedEdits(result.Content)
+		if len(proposedEdits) > 0 {
+			applied, editErrs := PromptAndApplyEdits(proposedEdits, autoApply)
+			for _, err := range editErrs {
+				fmt.Printf("  %s %v\n", red("[Edit Error]"), err)
+			}
+			if applied > 0 {
+				fmt.Printf("\n  %s Applied %d code modification(s) to your workspace.\n\n", green("SUCCESS:"), applied)
+			}
+		}
 	}
 }
 
@@ -547,24 +604,45 @@ func truncateStr(s string, max int) string {
 	return s[:max] + "..."
 }
 
-func printBanner(model, baseURL, projectID string, caveman bool) {
+func buildPrompt(caveman, autoApply bool, model string) string {
+	tags := ""
+	if caveman {
+		tags += green("[caveman]") + " "
+	}
+	if autoApply {
+		tags += yellow("[auto-write]") + " "
+	}
+	modelDisplay := model
+	if model == "auto" {
+		modelDisplay = "routed"
+	}
+	return fmt.Sprintf("%s %s[%s] > ", cyan("nexus"), tags, yellow(modelDisplay))
+}
+
+func printBanner(model, baseURL, projectID string, caveman, autoApply bool) {
 	p := getPricing(model)
 	cavemanStr := green("ON (token-saver)")
 	if !caveman {
 		cavemanStr = dim("OFF")
 	}
+	autoApplyStr := dim("OFF (manual [Y/n] confirmation)")
+	if autoApply {
+		autoApplyStr = yellow("ON (auto-write to disk)")
+	}
 	fmt.Println()
 	fmt.Println(bold(cyan("  +====================================================+")))
-	fmt.Println(bold(cyan("  |      NEXUS AI GATEWAY  -  Interactive Chat          |")))
+	fmt.Println(bold(cyan("  |      NEXUS AI GATEWAY  -  Interactive Coding Agent  |")))
 	fmt.Println(bold(cyan("  +====================================================+")))
-	fmt.Printf("  Model:   %s -> %s (%s)\n", yellow(model), bold(p.Display), p.Provider)
-	fmt.Printf("  Caveman: %s\n", cavemanStr)
-	fmt.Printf("  Gateway: %s\n", cyan(baseURL))
+	fmt.Printf("  Model:       %s -> %s (%s)\n", yellow(model), bold(p.Display), p.Provider)
+	fmt.Printf("  Auto-Apply:  %s\n", autoApplyStr)
+	fmt.Printf("  Caveman:     %s\n", cavemanStr)
+	fmt.Printf("  Suggest:     Press %s anytime to autocomplete %s and %s\n", bold("[Tab]"), cyan("/commands"), cyan("@files/@dirs"))
+	fmt.Printf("  Gateway:     %s\n", cyan(baseURL))
 	if projectID != "" {
-		fmt.Printf("  Project: %s\n", cyan(projectID))
+		fmt.Printf("  Project:     %s\n", cyan(projectID))
 	}
 	fmt.Println(dim("  ----------------------------------------------------"))
-	fmt.Println(dim("  /model <name>  /caveman on|off  /stats  /usage  /exit"))
+	fmt.Println(dim("  /auto on|off  /model <name>  /caveman on|off  /exit"))
 	fmt.Println(dim("  ----------------------------------------------------"))
 	fmt.Println()
 }
@@ -573,6 +651,7 @@ func printChatHelp() {
 	fmt.Println()
 	fmt.Println(bold("  Available Commands:"))
 	fmt.Printf("  %-22s %s\n", cyan("/model <name>"), "Switch model: auto, fast, cheap, smart, quality, gpt-4o...")
+	fmt.Printf("  %-22s %s\n", cyan("/auto on|off"), "Autonomous file editing (no [Y/n] prompt). Alias for /auto-apply.")
 	fmt.Printf("  %-22s %s\n", cyan("/caveman on|off"), "Toggle concise direct output for maximum token savings")
 	fmt.Printf("  %-22s %s\n", cyan("/models"), "List available model aliases from gateway")
 	fmt.Printf("  %-22s %s\n", cyan("/stats"), "Session stats and savings vs GPT-4o baseline")
@@ -581,8 +660,13 @@ func printChatHelp() {
 	fmt.Printf("  %-22s %s\n", cyan("/clear"), "Clear conversation history")
 	fmt.Printf("  %-22s %s\n", cyan("/exit  /quit"), "Quit chat")
 	fmt.Println()
+	fmt.Println(bold("  Interactive Autocomplete & Context:"))
+	fmt.Printf("  %-22s %s\n", cyan("[Tab] key"), "Autocompletes slash commands (/m -> /model) and arguments")
+	fmt.Printf("  %-22s %s\n", cyan("@file / @dir"), "Type @ and press [Tab] to list and complete workspace files/folders")
+	fmt.Printf("  %-22s %s\n", cyan("edit / create"), "Nexus proposes diffs and prompts [Y/n] to apply (or auto-writes if /auto on)")
+	fmt.Println()
 	fmt.Println(bold("  Model Aliases & Tiers:"))
-	fmt.Printf("  %-14s -> Dynamic routing: fast for simple, smart for complex\n", yellow("auto"))
+	fmt.Printf("  %-14s -> Dynamic routing: fast for simple, smart for complex  (prompt shows [routed])\n", yellow("auto"))
 	fmt.Printf("  %-14s -> Google gemini-3.6-flash ($0.075/Mtok in) - ultra fast\n", yellow("fast"))
 	fmt.Printf("  %-14s -> OpenAI gpt-4o-mini ($0.15/Mtok in) - cheap & capable\n", yellow("cheap"))
 	fmt.Printf("  %-14s -> OpenAI gpt-4o ($2.50/Mtok in) - deep reasoning\n", yellow("smart"))
