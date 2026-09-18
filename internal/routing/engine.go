@@ -1,4 +1,4 @@
-﻿// Package routing provides semantic and heuristic routing intelligence for Nexus AI Gateway.
+// Package routing provides semantic and heuristic routing intelligence for Nexus AI Gateway.
 package routing
 
 import (
@@ -31,11 +31,15 @@ type Decision struct {
 	RequestedModel  string            `json:"requested_model"`
 	SelectedModel   string            `json:"selected_model"`
 	ProviderID      string            `json:"provider_id"`
+	Preset          string            `json:"preset"` // "explore" | "build" | "reason" | "review" | "pinned"
 	Tier            string            `json:"tier"`
 	Complexity      float64           `json:"complexity_score"`
+	Confidence      int               `json:"confidence_percent"`
 	Intent          string            `json:"intent"`
 	Rationale       string            `json:"rationale"`
 	ContextChars    int               `json:"context_chars"`
+	EstimatedCost   float64           `json:"estimated_cost"`
+	BaselineCost    float64           `json:"baseline_cost"`
 	Candidates      []Candidate       `json:"-"`
 	FallbackTrace   []FallbackAttempt `json:"fallback_trace,omitempty"`
 	RedirectSummary string            `json:"redirect_summary,omitempty"`
@@ -122,84 +126,123 @@ func (e *Engine) RoutePlan(req *provider.ChatRequest, policy *domain.RoutingPoli
 		smartPool = append(smartPool, Candidate{Provider: anthropicProv, ProviderID: "anthropic", Model: "claude-3-5-sonnet-20241022", Tier: "smart"})
 	}
 	if hasGemini {
-		smartPool = append(smartPool, Candidate{Provider: geminiProv, ProviderID: "gemini", Model: "gemini-2.5-pro", Tier: "smart"})
+		smartPool = append(smartPool, Candidate{Provider: geminiProv, ProviderID: "gemini", Model: "gemini-3.7-flash", Tier: "smart"})
 	}
 
 	ctxChars := countChars(req.Messages)
 	var candidates []Candidate
 	var initialTier string
+	var preset string
 	var complexity float64
 	var intent string
 	var rationale string
+	var confidence int = 85
 
 	switch {
 	case model == "auto":
 		complexity, intent, rationale = analyzeComplexity(req.Messages)
-		if complexity >= 0.5 {
+		switch {
+		case complexity >= 0.8:
+			preset = "reason"
 			initialTier = "smart"
-			// Start with smart candidates, failover to remaining smart, then cross-tier to fast
+			confidence = 90
 			candidates = append(candidates, smartPool...)
 			candidates = append(candidates, fastPool...)
-		} else {
+		case complexity >= 0.4:
+			preset = "build"
+			initialTier = "smart"
+			confidence = 88
+			candidates = append(candidates, smartPool...)
+			candidates = append(candidates, fastPool...)
+		default:
+			preset = "explore"
 			initialTier = "fast"
-			// Start with fast candidates, failover to remaining fast, then cross-tier to smart
+			confidence = 92
 			candidates = append(candidates, fastPool...)
 			candidates = append(candidates, smartPool...)
 		}
 
-	case model == "cheap" || model == "fast":
+	case model == "explore" || model == "cheap" || model == "fast":
+		preset = "explore"
 		initialTier = "fast"
 		complexity = 0.2
-		intent = "Explicit Tier Selection"
-		rationale = "User requested fast/cheap tier execution"
+		confidence = 95
+		intent = "Fast Exploration & Read-Only Context"
+		rationale = "Task-based preset: fast and low-cost execution for exploration, search, and reading"
 		candidates = append(candidates, fastPool...)
 		candidates = append(candidates, smartPool...) // cross-tier safety net
 
-	case model == "smart" || model == "quality":
+	case model == "build":
+		preset = "build"
 		initialTier = "smart"
-		complexity = 0.8
-		intent = "Explicit Tier Selection"
-		rationale = "User requested smart/quality tier execution"
+		complexity = 0.65
+		confidence = 90
+		intent = "Balanced Code Implementation"
+		rationale = "Task-based preset: balanced models for coding, surgical refactoring, and test writing"
 		candidates = append(candidates, smartPool...)
 		candidates = append(candidates, fastPool...) // cross-tier safety net
 
+	case model == "reason" || model == "smart" || model == "quality":
+		preset = "reason"
+		initialTier = "smart"
+		complexity = 0.88
+		confidence = 94
+		intent = "Deep Architecture & Logic Reasoning"
+		rationale = "Task-based preset: high-reasoning frontier models for hard bugs, concurrency, and architecture"
+		candidates = append(candidates, smartPool...)
+		candidates = append(candidates, fastPool...)
+
+	case model == "review":
+		preset = "review"
+		initialTier = "smart"
+		complexity = 0.75
+		confidence = 91
+		intent = "Code Review & Security Analysis"
+		rationale = "Task-based preset: multi-pass review, vulnerability analysis, and code quality inspection"
+		candidates = append(candidates, smartPool...)
+		candidates = append(candidates, fastPool...)
+
 	case strings.HasPrefix(model, "claude-"):
+		preset = "pinned"
 		initialTier = "explicit-model"
 		complexity = 0.7
+		confidence = 99
 		intent = "Specific Model Pinning"
 		rationale = "User pinned Anthropic Claude model family"
 		if hasAnthropic {
 			candidates = append(candidates, Candidate{Provider: anthropicProv, ProviderID: "anthropic", Model: model, Tier: "primary"})
 		}
-		// Fallbacks
 		candidates = append(candidates, smartPool...)
 		candidates = append(candidates, fastPool...)
 
 	case strings.HasPrefix(model, "gemini-"):
+		preset = "pinned"
 		initialTier = "explicit-model"
 		complexity = 0.3
+		confidence = 99
 		intent = "Specific Model Pinning"
 		rationale = "User pinned Google Gemini model family"
 		if hasGemini {
 			candidates = append(candidates, Candidate{Provider: geminiProv, ProviderID: "gemini", Model: model, Tier: "primary"})
 		}
-		// Fallbacks
 		candidates = append(candidates, fastPool...)
 		candidates = append(candidates, smartPool...)
 
 	case strings.HasPrefix(model, "gpt-"):
+		preset = "pinned"
 		initialTier = "explicit-model"
 		complexity = 0.7
+		confidence = 99
 		intent = "Specific Model Pinning"
 		rationale = "User pinned OpenAI GPT model family"
 		if hasOpenAI {
 			candidates = append(candidates, Candidate{Provider: openaiProv, ProviderID: "openai", Model: model, Tier: "primary"})
 		}
-		// Fallbacks
 		candidates = append(candidates, smartPool...)
 		candidates = append(candidates, fastPool...)
 
 	default:
+		preset = "custom"
 		if p, ok := e.providerReg.Get(model); ok {
 			candidates = append(candidates, Candidate{Provider: p, ProviderID: model, Model: model, Tier: "primary"})
 		}
@@ -207,6 +250,7 @@ func (e *Engine) RoutePlan(req *provider.ChatRequest, policy *domain.RoutingPoli
 		candidates = append(candidates, smartPool...)
 		initialTier = "fallback-fast"
 		complexity = 0.2
+		confidence = 80
 		intent = "Custom / Fallback Routing"
 		rationale = "Routing through registered models"
 	}
@@ -223,15 +267,32 @@ func (e *Engine) RoutePlan(req *provider.ChatRequest, policy *domain.RoutingPoli
 		})
 	}
 
+	// Calculate estimated cost vs baseline
+	estInputTokens := float64(ctxChars) / 4.0
+	if estInputTokens < 50 {
+		estInputTokens = 50
+	}
+	baselineCost := (estInputTokens / 1_000_000.0) * 3.00 // Claude 3.5 Sonnet baseline
+	var estCost float64
+	if initialTier == "fast" {
+		estCost = (estInputTokens / 1_000_000.0) * 0.075 // Gemini Flash rate
+	} else {
+		estCost = (estInputTokens / 1_000_000.0) * 2.50
+	}
+
 	return &Decision{
 		RequestedModel: model,
 		SelectedModel:  candidates[0].Model,
 		ProviderID:     candidates[0].ProviderID,
+		Preset:         preset,
 		Tier:           initialTier,
 		Complexity:     complexity,
+		Confidence:     confidence,
 		Intent:         intent,
 		Rationale:      rationale,
 		ContextChars:   ctxChars,
+		EstimatedCost:  estCost,
+		BaselineCost:   baselineCost,
 		Candidates:     candidates,
 	}, nil
 }

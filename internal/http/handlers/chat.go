@@ -1,4 +1,4 @@
-﻿// Package handlers contains HTTP request handlers.
+// Package handlers contains HTTP request handlers.
 package handlers
 
 import (
@@ -314,10 +314,14 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 11. Set response headers
 	w.Header().Set("X-Nexus-Route-Model", plan.SelectedModel)
 	w.Header().Set("X-Nexus-Route-Provider", plan.ProviderID)
+	w.Header().Set("X-Nexus-Route-Preset", plan.Preset)
 	w.Header().Set("X-Nexus-Route-Tier", plan.Tier)
 	w.Header().Set("X-Nexus-Route-Complexity", fmt.Sprintf("%.2f", plan.Complexity))
+	w.Header().Set("X-Nexus-Route-Confidence", fmt.Sprintf("%d", plan.Confidence))
 	w.Header().Set("X-Nexus-Route-Intent", plan.Intent)
 	w.Header().Set("X-Nexus-Route-Rationale", plan.Rationale)
+	w.Header().Set("X-Nexus-Route-EstCost", fmt.Sprintf("%.6f", plan.EstimatedCost))
+	w.Header().Set("X-Nexus-Route-BaselineCost", fmt.Sprintf("%.6f", plan.BaselineCost))
 	if len(plan.FallbackTrace) > 0 {
 		w.Header().Set("X-Nexus-Fallback-Count", fmt.Sprintf("%d", len(plan.FallbackTrace)))
 		w.Header().Set("X-Nexus-Redirect-Summary", plan.RedirectSummary)
@@ -378,14 +382,18 @@ func toOpenAIResponse(resp *provider.ChatResponse, requestID string, decision *r
 
 	if decision != nil {
 		routingMap := map[string]interface{}{
-			"requested_model":  decision.RequestedModel,
-			"selected_model":   decision.SelectedModel,
-			"provider":         decision.ProviderID,
-			"tier":             decision.Tier,
-			"complexity_score": decision.Complexity,
-			"intent":           decision.Intent,
-			"rationale":        decision.Rationale,
-			"context_chars":    decision.ContextChars,
+			"requested_model":    decision.RequestedModel,
+			"selected_model":     decision.SelectedModel,
+			"provider":           decision.ProviderID,
+			"preset":             decision.Preset,
+			"tier":               decision.Tier,
+			"complexity_score":   decision.Complexity,
+			"confidence_percent": decision.Confidence,
+			"intent":             decision.Intent,
+			"rationale":          decision.Rationale,
+			"context_chars":      decision.ContextChars,
+			"estimated_cost":     decision.EstimatedCost,
+			"baseline_cost":      decision.BaselineCost,
 		}
 		if len(decision.FallbackTrace) > 0 {
 			routingMap["fallback_trace"] = decision.FallbackTrace
@@ -404,6 +412,7 @@ func estimateCost(model string, usage provider.TokenUsage) float64 {
 		"gpt-4o-mini":               {0.00015, 0.0006},
 		"claude-3-5-sonnet-20241022": {0.003, 0.015},
 		"claude-3-haiku-20240307":   {0.00025, 0.00125},
+		"gemini-3.7-flash":           {0.00015, 0.0006},
 		"gemini-3.6-flash":           {0.000075, 0.0003},
 		"gemini-2.0-flash":           {0.000075, 0.0003},
 		"gemini-2.5-pro":             {0.00125, 0.005},

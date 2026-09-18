@@ -3,6 +3,12 @@
 # Binary build
 build:
 	go build -o bin/gateway-api ./cmd/gateway-api
+	go build -o bin/switchyard ./cmd/switchyard
+	go build -o bin/sy ./cmd/switchyard
+
+build-switchyard:
+	go build -o bin/switchyard ./cmd/switchyard
+	go build -o bin/sy ./cmd/switchyard
 
 # Run local unit tests
 test:
