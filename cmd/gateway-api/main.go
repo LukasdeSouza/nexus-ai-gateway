@@ -93,6 +93,7 @@ func main() {
 		aliasRepo  *postgres.ModelAliasRepo
 		recRepo    *postgres.RequestRecordRepo
 	)
+	var taskRepo handlers.TaskStore
 	if pgPool != nil {
 		orgRepo = postgres.NewOrganizationRepo(pgPool)
 		prjRepo = postgres.NewProjectRepo(pgPool)
@@ -101,6 +102,7 @@ func main() {
 		policyRepo = postgres.NewRoutingPolicyRepo(pgPool)
 		aliasRepo = postgres.NewModelAliasRepo(pgPool)
 		recRepo = postgres.NewRequestRecordRepo(pgPool)
+		taskRepo = postgres.NewTaskRepo(pgPool)
 
 		// Seed baseline model aliases
 		if err := aliasRepo.SeedDefaults(ctx); err != nil {
@@ -170,6 +172,7 @@ func main() {
 		ProvidersHandler:     handlers.NewProvidersRouter(pconnRepo),
 		UsageHandler:         handlers.NewUsageHandler(recRepo),
 		RequestsHandler:      handlers.NewRequestsHandler(recRepo),
+		TasksHandler:         handlers.NewTasksRouter(taskRepo),
 	})
 
 	// 11. Handle Graceful Shutdown

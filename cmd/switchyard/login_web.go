@@ -147,7 +147,7 @@ func StartWebAuthFlow(frontendURL, gatewayURL string) (*Credentials, error) {
 </head>
 <body>
   <div class="card">
-    <h1>✓ CLI Authorized Successfully</h1>
+    <h1>[SUCCESS] CLI Authorized Successfully</h1>
     <p>Your local terminal is now connected to Switchyard.<br>You can safely close this window and return to your terminal.</p>
     <a class="btn" href="javascript:window.close()">Close Window</a>
   </div>
@@ -195,7 +195,7 @@ func StartWebAuthFlow(frontendURL, gatewayURL string) (*Credentials, error) {
 			return nil, res.err
 		}
 		fmt.Println()
-		fmt.Println(bold(green("  ✓ Authenticated successfully!")))
+		fmt.Println(bold(green("  [SUCCESS] Authenticated successfully!")))
 		fmt.Println(dim("  Credentials saved to ~/.switchyard/credentials.json"))
 		if res.creds.ProjectID != "" {
 			fmt.Printf("  Project: %s\n", cyan(res.creds.ProjectID))

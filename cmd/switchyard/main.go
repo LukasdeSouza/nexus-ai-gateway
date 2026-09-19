@@ -296,6 +296,17 @@ func main() {
 			}
 		}
 
+	case "daemon", "worker":
+		fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+		projectFlag := fs.String("project", "", "Project ID")
+		urlFlag := fs.String("url", DefaultGatewayURL, "Switchyard Gateway Base URL")
+		fs.Parse(os.Args[2:])
+
+		if err := StartDaemonWorker(*projectFlag, *urlFlag); err != nil {
+			fmt.Println(red(fmt.Sprintf("Daemon error: %v", err)))
+			os.Exit(1)
+		}
+
 	case "whoami":
 		creds, err := loadCredentials()
 		if err != nil || creds.APIKey == "" {
@@ -327,7 +338,8 @@ func printRootHelp() {
 	fmt.Println(bold("  Usage:"))
 	fmt.Printf("    %s %s\n", cyan("switchyard run"), dim("\"<prompt>\" [--preset <name>] [--policy <mode>] [--budget <usd>]"))
 	fmt.Printf("    %s %s\n", cyan("switchyard chat"), dim("[--preset <name>] [--policy <mode>] [--budget <usd>]"))
-	fmt.Printf("    %s %s\n", cyan("switchyard login"), dim("-key <key> [-project <id>]"))
+	fmt.Printf("    %s %s\n", cyan("switchyard daemon"), dim("[-project <id>] [-url <url>]"))
+	fmt.Printf("    %s %s\n", cyan("switchyard login"), dim("[-key <key>] [-project <id>]"))
 	fmt.Printf("    %s\n", cyan("switchyard whoami"))
 	fmt.Println()
 	fmt.Println(bold("  Task Presets:"))
@@ -484,6 +496,25 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy, i
 	policy := initialPolicy
 	budget := initialBudget
 	caveman := true
+
+	// Load repository-level configuration (.switchyard.json) if present
+	if localCfg := loadLocalRepoConfig(); localCfg != nil {
+		if preset == "auto" && localCfg.Preset != "" {
+			preset = localCfg.Preset
+		}
+		if policy == PolicyApprove && localCfg.Policy != "" {
+			if parsedPol, pErr := ParsePolicy(localCfg.Policy); pErr == nil {
+				policy = parsedPol
+			}
+		}
+		if budget == 0.0 && localCfg.Budget > 0 {
+			budget = localCfg.Budget
+		}
+		if localCfg.Caveman != nil {
+			caveman = *localCfg.Caveman
+		}
+	}
+
 	stats := newSessionStats()
 	var history []map[string]string
 
@@ -510,6 +541,23 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy, i
 		return
 	}
 	defer rl.Close()
+
+	// Launch background task listener for Web-to-CLI relay while inside interactive chat
+	if projectID != "" {
+		hostname, _ := os.Hostname()
+		workerID := "cli-chat-" + hostname
+		client := &http.Client{Timeout: 5 * time.Second}
+		go func() {
+			ticker := time.NewTicker(3 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				executed, _ := PollAndExecuteSingleTask(client, baseURL, projectID, workerID)
+				if executed {
+					rl.Refresh()
+				}
+			}
+		}()
+	}
 
 	for {
 		rl.SetPrompt(buildPrompt(caveman, policy, preset, budget))

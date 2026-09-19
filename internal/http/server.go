@@ -37,6 +37,7 @@ type Dependencies struct {
 	RequestsHandler      http.HandlerFunc
 	CliAuthHandler       http.HandlerFunc
 	CliRotateHandler     http.HandlerFunc
+	TasksHandler         http.Handler
 }
 
 // corsMiddleware handles Cross-Origin Resource Sharing for browser access.
@@ -81,6 +82,11 @@ func New(deps Dependencies) *Server {
 		}
 		if deps.CliRotateHandler != nil {
 			r.Post("/auth/rotate-key", deps.CliRotateHandler)
+		}
+
+		// Remote Task Queue Dispatch
+		if deps.TasksHandler != nil {
+			r.Mount("/tasks", deps.TasksHandler)
 		}
 
 		// OpenAI-compatible inference endpoint
