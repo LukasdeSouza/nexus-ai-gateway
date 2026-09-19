@@ -183,8 +183,22 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		TopP:        reqBody.TopP,
 		Stop:        reqBody.Stop,
 		User:        reqBody.User,
-		RequestID:   requestID,
-		ProjectID:   tc.Project.ID,
+		RequestID:     requestID,
+		ProjectID:     tc.Project.ID,
+		CustomAPIKeys: make(map[string]string),
+	}
+
+	if k := r.Header.Get("X-Gemini-Api-Key"); k != "" {
+		provReq.CustomAPIKeys["gemini"] = k
+	}
+	if k := r.Header.Get("X-OpenAI-Api-Key"); k != "" {
+		provReq.CustomAPIKeys["openai"] = k
+	}
+	if k := r.Header.Get("X-Anthropic-Api-Key"); k != "" {
+		provReq.CustomAPIKeys["anthropic"] = k
+	}
+	if k := r.Header.Get("X-Deepseek-Api-Key"); k != "" {
+		provReq.CustomAPIKeys["deepseek"] = k
 	}
 
 	// Apply Caveman mode

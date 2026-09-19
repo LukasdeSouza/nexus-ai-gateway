@@ -24,8 +24,9 @@ type ChatRequest struct {
 	TopP        *float32  `json:"top_p,omitempty"`
 	Stop        []string  `json:"stop,omitempty"`
 	User        string    `json:"user,omitempty"`
-	RequestID   string    `json:"request_id,omitempty"`
-	ProjectID   string    `json:"project_id,omitempty"`
+	RequestID     string            `json:"request_id,omitempty"`
+	ProjectID     string            `json:"project_id,omitempty"`
+	CustomAPIKeys map[string]string `json:"custom_api_keys,omitempty"`
 }
 
 // Message represents a single conversational turn.

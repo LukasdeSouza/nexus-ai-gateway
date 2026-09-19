@@ -149,8 +149,9 @@ func (a *Adapter) Chat(ctx context.Context, req *provider.ChatRequest) (*provide
 	}
 
 	endpoint := fmt.Sprintf("%s/v1/models/%s:generateContent", a.baseURL, req.Model)
-	if a.apiKey != "" {
-		endpoint += "?key=" + a.apiKey
+	apiKey := a.resolveAPIKey(req)
+	if apiKey != "" {
+		endpoint += "?key=" + apiKey
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
@@ -243,8 +244,9 @@ func (a *Adapter) StreamChat(ctx context.Context, req *provider.ChatRequest) (<-
 	}
 
 	endpoint := fmt.Sprintf("%s/v1/models/%s:streamGenerateContent?alt=sse", a.baseURL, req.Model)
-	if a.apiKey != "" {
-		endpoint += "&key=" + a.apiKey
+	streamAPIKey := a.resolveAPIKey(req)
+	if streamAPIKey != "" {
+		endpoint += "&key=" + streamAPIKey
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
@@ -344,6 +346,15 @@ func (a *Adapter) StreamChat(ctx context.Context, req *provider.ChatRequest) (<-
 	}()
 
 	return out, nil
+}
+
+func (a *Adapter) resolveAPIKey(req *provider.ChatRequest) string {
+	if req != nil && req.CustomAPIKeys != nil {
+		if k, ok := req.CustomAPIKeys["gemini"]; ok && k != "" {
+			return k
+		}
+	}
+	return a.apiKey
 }
 
 func isStatusCodeRetryable(code int) bool {

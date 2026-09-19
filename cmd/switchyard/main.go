@@ -171,9 +171,10 @@ func (s *SessionStats) Print() {
 
 // Credentials management
 type Credentials struct {
-	APIKey    string `json:"api_key"`
-	ProjectID string `json:"project_id"`
-	BaseURL   string `json:"base_url"`
+	APIKey       string            `json:"api_key"`
+	ProjectID    string            `json:"project_id"`
+	BaseURL      string            `json:"base_url"`
+	ProviderKeys map[string]string `json:"provider_keys,omitempty"`
 }
 
 func credentialsFilePath() string {
@@ -307,6 +308,9 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "keys", "key":
+		handleKeysCommand(os.Args[2:])
+
 	case "whoami":
 		creds, err := loadCredentials()
 		if err != nil || creds.APIKey == "" {
@@ -331,6 +335,82 @@ func main() {
 	}
 }
 
+func handleKeysCommand(args []string) {
+	creds, _ := loadCredentials()
+	if creds == nil {
+		creds = &Credentials{}
+	}
+	if creds.ProviderKeys == nil {
+		creds.ProviderKeys = make(map[string]string)
+	}
+
+	if len(args) == 0 || args[0] == "list" {
+		fmt.Println()
+		fmt.Println(bold(cyan("  ========================================================")))
+		fmt.Println(bold(cyan("    SWITCHYARD PROVIDER KEYS  -  Bring Your Own Key (BYOK)")))
+		fmt.Println(bold(cyan("  ========================================================")))
+		providers := []string{"gemini", "openai", "anthropic", "deepseek"}
+		for _, p := range providers {
+			val := creds.ProviderKeys[p]
+			envVar := strings.ToUpper(p) + "_API_KEY"
+			if p == "gemini" {
+				envVar = "GEMINI_API_KEY"
+			}
+			envVal := os.Getenv(envVar)
+
+			if val != "" {
+				masked := val[:min(6, len(val))] + "..." + val[max(0, len(val)-4):]
+				fmt.Printf("  %-12s %s  (%s)\n", yellow(p+":"), green("[CONFIGURED]"), dim(masked))
+			} else if envVal != "" {
+				masked := envVal[:min(6, len(envVal))] + "..." + envVal[max(0, len(envVal)-4):]
+				fmt.Printf("  %-12s %s  (%s env)\n", yellow(p+":"), cyan("[ENV SET]"), dim(masked))
+			} else {
+				fmt.Printf("  %-12s %s  %s\n", yellow(p+":"), dim("[NOT SET]"), dim("(uses Gateway server default)"))
+			}
+		}
+		fmt.Println(dim("  --------------------------------------------------------"))
+		fmt.Println(dim("  Usage:"))
+		fmt.Println(dim("    switchyard keys set <provider> <key>    (e.g. switchyard keys set gemini AIzaSy...)"))
+		fmt.Println(dim("    switchyard keys remove <provider>       (e.g. switchyard keys remove openai)"))
+		fmt.Println(dim("  --------------------------------------------------------"))
+		fmt.Println()
+		return
+	}
+
+	subCmd := strings.ToLower(args[0])
+	switch subCmd {
+	case "set":
+		if len(args) < 3 {
+			fmt.Println(red("  Error: Missing provider or key. Usage: switchyard keys set <gemini|openai|anthropic|deepseek> <key>"))
+			return
+		}
+		p := strings.ToLower(args[1])
+		key := strings.TrimSpace(args[2])
+		creds.ProviderKeys[p] = key
+		if err := saveCredentials(creds); err != nil {
+			fmt.Println(red(fmt.Sprintf("  Failed to save key: %v", err)))
+			return
+		}
+		fmt.Println(bold(green(fmt.Sprintf("  [SUCCESS] Configured provider key for '%s'. Saved to ~/.switchyard/credentials.json", p))))
+
+	case "remove", "rm", "delete":
+		if len(args) < 2 {
+			fmt.Println(red("  Error: Missing provider. Usage: switchyard keys remove <gemini|openai|anthropic|deepseek>"))
+			return
+		}
+		p := strings.ToLower(args[1])
+		delete(creds.ProviderKeys, p)
+		if err := saveCredentials(creds); err != nil {
+			fmt.Println(red(fmt.Sprintf("  Failed to update credentials: %v", err)))
+			return
+		}
+		fmt.Println(bold(green(fmt.Sprintf("  [SUCCESS] Removed provider key for '%s'.", p))))
+
+	default:
+		fmt.Println(red(fmt.Sprintf("  Unknown keys subcommand '%s'. Use 'switchyard keys set' or 'switchyard keys remove'.", subCmd)))
+	}
+}
+
 func printRootHelp() {
 	fmt.Println()
 	fmt.Println(bold(cyan("  SWITCHYARD - The Routing, Cost & Safety Layer for AI Coding Agents")))
@@ -339,6 +419,7 @@ func printRootHelp() {
 	fmt.Printf("    %s %s\n", cyan("switchyard run"), dim("\"<prompt>\" [--preset <name>] [--policy <mode>] [--budget <usd>]"))
 	fmt.Printf("    %s %s\n", cyan("switchyard chat"), dim("[--preset <name>] [--policy <mode>] [--budget <usd>]"))
 	fmt.Printf("    %s %s\n", cyan("switchyard daemon"), dim("[-project <id>] [-url <url>]"))
+	fmt.Printf("    %s %s\n", cyan("switchyard keys"), dim("[set|remove] <provider> <key>"))
 	fmt.Printf("    %s %s\n", cyan("switchyard login"), dim("[-key <key>] [-project <id>]"))
 	fmt.Printf("    %s\n", cyan("switchyard whoami"))
 	fmt.Println()
@@ -865,6 +946,43 @@ func sendChatConversation(baseURL, apiKey, preset string, history []map[string]s
 	req.Header.Set("X-Switchyard-Policy", string(policy))
 	if caveman {
 		req.Header.Set("X-Nexus-Caveman", "true")
+	}
+
+	// Forward BYOK provider keys from ~/.switchyard/credentials.json or environment
+	if creds, err := loadCredentials(); err == nil && creds != nil && creds.ProviderKeys != nil {
+		if k := creds.ProviderKeys["gemini"]; k != "" {
+			req.Header.Set("X-Gemini-Api-Key", k)
+		}
+		if k := creds.ProviderKeys["openai"]; k != "" {
+			req.Header.Set("X-OpenAI-Api-Key", k)
+		}
+		if k := creds.ProviderKeys["anthropic"]; k != "" {
+			req.Header.Set("X-Anthropic-Api-Key", k)
+		}
+		if k := creds.ProviderKeys["deepseek"]; k != "" {
+			req.Header.Set("X-Deepseek-Api-Key", k)
+		}
+	}
+	// Also honour plain environment variables as fallback
+	if k := os.Getenv("GEMINI_API_KEY"); k != "" {
+		if req.Header.Get("X-Gemini-Api-Key") == "" {
+			req.Header.Set("X-Gemini-Api-Key", k)
+		}
+	}
+	if k := os.Getenv("OPENAI_API_KEY"); k != "" {
+		if req.Header.Get("X-OpenAI-Api-Key") == "" {
+			req.Header.Set("X-OpenAI-Api-Key", k)
+		}
+	}
+	if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
+		if req.Header.Get("X-Anthropic-Api-Key") == "" {
+			req.Header.Set("X-Anthropic-Api-Key", k)
+		}
+	}
+	if k := os.Getenv("DEEPSEEK_API_KEY"); k != "" {
+		if req.Header.Get("X-Deepseek-Api-Key") == "" {
+			req.Header.Set("X-Deepseek-Api-Key", k)
+		}
 	}
 
 	client := &http.Client{Timeout: 90 * time.Second}

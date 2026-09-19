@@ -138,8 +138,9 @@ func (a *Adapter) Chat(ctx context.Context, req *provider.ChatRequest) (*provide
 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	if a.apiKey != "" {
-		httpReq.Header.Set("x-api-key", a.apiKey)
+	apiKey := a.resolveAPIKey(req)
+	if apiKey != "" {
+		httpReq.Header.Set("x-api-key", apiKey)
 	}
 	if req.RequestID != "" {
 		httpReq.Header.Set("X-Request-ID", req.RequestID)
@@ -237,8 +238,9 @@ func (a *Adapter) StreamChat(ctx context.Context, req *provider.ChatRequest) (<-
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	if a.apiKey != "" {
-		httpReq.Header.Set("x-api-key", a.apiKey)
+	streamAPIKey := a.resolveAPIKey(req)
+	if streamAPIKey != "" {
+		httpReq.Header.Set("x-api-key", streamAPIKey)
 	}
 	if req.RequestID != "" {
 		httpReq.Header.Set("X-Request-ID", req.RequestID)
@@ -373,6 +375,15 @@ func (a *Adapter) StreamChat(ctx context.Context, req *provider.ChatRequest) (<-
 	}()
 
 	return out, nil
+}
+
+func (a *Adapter) resolveAPIKey(req *provider.ChatRequest) string {
+	if req != nil && req.CustomAPIKeys != nil {
+		if k, ok := req.CustomAPIKeys["anthropic"]; ok && k != "" {
+			return k
+		}
+	}
+	return a.apiKey
 }
 
 func isStatusCodeRetryable(code int) bool {
