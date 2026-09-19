@@ -17,6 +17,7 @@ type APIKeyStore interface {
 	Create(ctx context.Context, key *domain.APIKey) error
 	Revoke(ctx context.Context, id string) error
 	ListByProject(ctx context.Context, projectID string) ([]*domain.APIKey, error)
+	GetByHash(ctx context.Context, hash string) (*domain.APIKey, error)
 }
 
 // NewAPIKeysRouter creates a sub-router for /api-keys endpoints.

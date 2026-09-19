@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"bufio"
@@ -53,11 +53,48 @@ func ParseProposedEdits(response string) []ProposedEdit {
 	return edits
 }
 
+// PrintExecutionPlanManifest renders a unified summary of the task's intended file actions and safety checks.
+func PrintExecutionPlanManifest(edits []ProposedEdit, policy ExecutionPolicy) {
+	fmt.Println()
+	fmt.Println(bold(cyan("  +=======================================================+")))
+	fmt.Println(bold(cyan("  |              EXECUTION PLAN MANIFEST                  |")))
+	fmt.Println(bold(cyan("  +=======================================================+")))
+	fmt.Printf("  Policy:     %s\n", bold(formatPolicyLabel(policy)))
+	fmt.Printf("  Intended:   %d file change(s) proposed\n", len(edits))
+
+	var protectedList []string
+	for i, edit := range edits {
+		cleanPath := filepath.Clean(edit.FilePath)
+		actionLabel := "[CREATE]"
+		if edit.Action == "edit" {
+			actionLabel = "[MODIFY]"
+		}
+		isProt, reason := IsProtectedFile(cleanPath)
+		if isProt {
+			actionLabel += red(" [PROTECTED]")
+			protectedList = append(protectedList, fmt.Sprintf("%s (%s)", cleanPath, reason))
+		}
+		fmt.Printf("    %d. %-18s %s\n", i+1, actionLabel, bold(cleanPath))
+	}
+
+	if len(protectedList) > 0 {
+		fmt.Printf("  Safety:     %s %s\n", red("CAUTION:"), fmt.Sprintf("%d protected file(s) targeted", len(protectedList)))
+		for _, p := range protectedList {
+			fmt.Printf("              - %s\n", dim(p))
+		}
+	} else {
+		fmt.Printf("  Safety:     %s (no secrets or lockfiles affected)\n", green("PASSED"))
+	}
+	fmt.Println(bold(cyan("  +=======================================================+")))
+}
+
 // ApplyEditsWithPolicy renders diffs and applies them subject to the active execution policy & safety guardrails.
 func ApplyEditsWithPolicy(edits []ProposedEdit, policy ExecutionPolicy, taskDesc string) (appliedCount int, blockedCount int, errs []error) {
 	if len(edits) == 0 {
 		return 0, 0, nil
 	}
+
+	PrintExecutionPlanManifest(edits, policy)
 
 	if policy == PolicyExplain {
 		fmt.Printf("\n  %s %s: %d proposed file edit(s) were not applied.\n\n",
@@ -66,13 +103,8 @@ func ApplyEditsWithPolicy(edits []ProposedEdit, policy ExecutionPolicy, taskDesc
 	}
 
 	if policy == PolicyPlan {
-		fmt.Printf("\n  %s %s: Previewing %d planned modification(s) (no files touched):\n",
-			cyan("[Policy: Plan]"), dim("Plan inspection mode"), len(edits))
-		for i, edit := range edits {
-			cleanPath := filepath.Clean(edit.FilePath)
-			fmt.Printf("    %d. [%s] %s\n", i+1, strings.ToUpper(edit.Action), cleanPath)
-		}
-		fmt.Println()
+		fmt.Printf("\n  %s %s: Planned changes displayed above. No files touched on disk.\n\n",
+			cyan("[Policy: Plan]"), dim("Plan inspection mode"))
 		return 0, len(edits), nil
 	}
 

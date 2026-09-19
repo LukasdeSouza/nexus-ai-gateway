@@ -219,17 +219,19 @@ func saveCredentials(creds *Credentials) error {
 
 func main() {
 	if len(os.Args) < 2 {
-		startInteractiveChat("auto", PolicyApprove)
+		startInteractiveChat("auto", PolicyApprove, 0.0)
 		return
 	}
 
 	cmd := os.Args[1]
 	switch cmd {
-	case "chat":
-		fs := flag.NewFlagSet("chat", flag.ExitOnError)
+	case "run":
+		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		presetFlag := fs.String("preset", "auto", "Model preset: auto, explore, build, reason, review")
 		modelFlag := fs.String("model", "", "Model alias or pinned provider:model")
-		policyFlag := fs.String("policy", "approve", "Execution policy: explain, plan, approve, safe-auto, autopilot")
+		policyFlag := fs.String("policy", "safe-auto", "Execution policy: explain, plan, approve, safe-auto, autopilot")
+		budgetFlag := fs.Float64("budget", 0.0, "Hard task budget limit in USD (e.g. 0.25)")
+		cavemanFlag := fs.Bool("caveman", true, "Enable concise token-saver responses")
 		fs.Parse(os.Args[2:])
 
 		selectedPreset := *presetFlag
@@ -241,30 +243,58 @@ func main() {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
-		startInteractiveChat(selectedPreset, policy)
+		prompt := strings.Join(fs.Args(), " ")
+		if strings.TrimSpace(prompt) == "" {
+			fmt.Println(red("Error: Task prompt is required. Usage: switchyard run [flags] \"<prompt>\""))
+			os.Exit(1)
+		}
+		runOneShotTask(selectedPreset, policy, *budgetFlag, *cavemanFlag, prompt)
+
+	case "chat":
+		fs := flag.NewFlagSet("chat", flag.ExitOnError)
+		presetFlag := fs.String("preset", "auto", "Model preset: auto, explore, build, reason, review")
+		modelFlag := fs.String("model", "", "Model alias or pinned provider:model")
+		policyFlag := fs.String("policy", "approve", "Execution policy: explain, plan, approve, safe-auto, autopilot")
+		budgetFlag := fs.Float64("budget", 0.0, "Hard task budget limit in USD (e.g. 0.25)")
+		fs.Parse(os.Args[2:])
+
+		selectedPreset := *presetFlag
+		if *modelFlag != "" {
+			selectedPreset = *modelFlag
+		}
+		policy, err := ParsePolicy(*policyFlag)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		startInteractiveChat(selectedPreset, policy, *budgetFlag)
 
 	case "login":
 		fs := flag.NewFlagSet("login", flag.ExitOnError)
-		keyFlag := fs.String("key", "", "Switchyard API Key (ngk_...)")
-		urlFlag := fs.String("url", "http://localhost:8080", "Switchyard Gateway Base URL")
+		keyFlag := fs.String("key", "", "Switchyard API Key (ngk_...) for manual authentication")
+		urlFlag := fs.String("url", DefaultGatewayURL, "Switchyard Gateway Base URL")
+		frontendFlag := fs.String("frontend", DefaultFrontendURL, "Switchyard Web Frontend URL")
 		projectFlag := fs.String("project", "", "Project ID")
 		fs.Parse(os.Args[2:])
 
-		key := *keyFlag
-		if key == "" {
-			fmt.Print("Enter Switchyard API Key (ngk_...): ")
-			fmt.Scanln(&key)
+		if *keyFlag != "" {
+			creds := &Credentials{
+				APIKey:    strings.TrimSpace(*keyFlag),
+				ProjectID: strings.TrimSpace(*projectFlag),
+				BaseURL:   strings.TrimSpace(*urlFlag),
+			}
+			if err := saveCredentials(creds); err != nil {
+				fmt.Println(red(fmt.Sprintf("Failed to save credentials: %v", err)))
+				os.Exit(1)
+			}
+			fmt.Println(green("Logged in successfully. Credentials saved to ~/.switchyard/credentials.json"))
+		} else {
+			_, err := StartWebAuthFlow(*frontendFlag, *urlFlag)
+			if err != nil {
+				fmt.Println(red(fmt.Sprintf("Authentication failed: %v", err)))
+				os.Exit(1)
+			}
 		}
-		creds := &Credentials{
-			APIKey:    strings.TrimSpace(key),
-			ProjectID: strings.TrimSpace(*projectFlag),
-			BaseURL:   strings.TrimSpace(*urlFlag),
-		}
-		if err := saveCredentials(creds); err != nil {
-			fmt.Println(red(fmt.Sprintf("Failed to save credentials: %v", err)))
-			os.Exit(1)
-		}
-		fmt.Println(green("Logged in successfully. Credentials saved to ~/.switchyard/credentials.json"))
 
 	case "whoami":
 		creds, err := loadCredentials()
@@ -286,7 +316,7 @@ func main() {
 	default:
 		// Default to running interactive chat with the first argument as preset
 		policy := PolicyApprove
-		startInteractiveChat(cmd, policy)
+		startInteractiveChat(cmd, policy, 0.0)
 	}
 }
 
@@ -295,7 +325,8 @@ func printRootHelp() {
 	fmt.Println(bold(cyan("  SWITCHYARD - The Routing, Cost & Safety Layer for AI Coding Agents")))
 	fmt.Println()
 	fmt.Println(bold("  Usage:"))
-	fmt.Printf("    %s %s\n", cyan("switchyard"), dim("[chat] [--preset <name>] [--policy <mode>]"))
+	fmt.Printf("    %s %s\n", cyan("switchyard run"), dim("\"<prompt>\" [--preset <name>] [--policy <mode>] [--budget <usd>]"))
+	fmt.Printf("    %s %s\n", cyan("switchyard chat"), dim("[--preset <name>] [--policy <mode>] [--budget <usd>]"))
 	fmt.Printf("    %s %s\n", cyan("switchyard login"), dim("-key <key> [-project <id>]"))
 	fmt.Printf("    %s\n", cyan("switchyard whoami"))
 	fmt.Println()
@@ -315,7 +346,7 @@ func printRootHelp() {
 	fmt.Println()
 }
 
-func buildPrompt(caveman bool, policy ExecutionPolicy, preset string) string {
+func buildPrompt(caveman bool, policy ExecutionPolicy, preset string, budget float64) string {
 	tags := ""
 	if caveman {
 		tags += green("[caveman]") + " "
@@ -332,6 +363,9 @@ func buildPrompt(caveman bool, policy ExecutionPolicy, preset string) string {
 	case PolicyAutopilot:
 		tags += magenta("[autopilot]") + " "
 	}
+	if budget > 0 {
+		tags += yellow(fmt.Sprintf("[$%.2f cap]", budget)) + " "
+	}
 
 	presetDisplay := preset
 	if preset == "auto" {
@@ -340,11 +374,16 @@ func buildPrompt(caveman bool, policy ExecutionPolicy, preset string) string {
 	return fmt.Sprintf("%s %s[%s] > ", cyan("switchyard"), tags, yellow(presetDisplay))
 }
 
-func printBanner(preset, baseURL, projectID string, caveman bool, policy ExecutionPolicy) {
+func printBanner(preset, baseURL, projectID string, caveman bool, policy ExecutionPolicy, budget float64) {
 	p := getPricing(preset)
 	cavemanStr := green("ON (token-saver)")
 	if !caveman {
 		cavemanStr = dim("OFF")
+	}
+
+	budgetStr := dim("UNLIMITED (no cap)")
+	if budget > 0 {
+		budgetStr = yellow(fmt.Sprintf("$%.4f per task", budget))
 	}
 
 	fmt.Println()
@@ -353,6 +392,7 @@ func printBanner(preset, baseURL, projectID string, caveman bool, policy Executi
 	fmt.Println(bold(cyan("  ========================================================")))
 	fmt.Printf("  Preset:      %s -> %s (%s)\n", yellow(preset), bold(p.Display), p.Provider)
 	fmt.Printf("  Policy:      %s\n", formatPolicyLabel(policy))
+	fmt.Printf("  Budget:      %s\n", budgetStr)
 	fmt.Printf("  Caveman:     %s\n", cavemanStr)
 	fmt.Printf("  Safety:      Protected file deny-lists + pre-task Git Checkpoints\n")
 	fmt.Printf("  Suggest:     Press %s for commands, presets, policies & @files\n", bold("[Tab]"))
@@ -361,7 +401,7 @@ func printBanner(preset, baseURL, projectID string, caveman bool, policy Executi
 		fmt.Printf("  Project:     %s\n", cyan(projectID))
 	}
 	fmt.Println(dim("  --------------------------------------------------------"))
-	fmt.Println(dim("  /policy <mode>  /preset <name>  /rollback  /stats  /exit"))
+	fmt.Println(dim("  /policy <mode>  /preset <name>  /budget <usd>  /rollback"))
 	fmt.Println(dim("  --------------------------------------------------------"))
 	fmt.Println()
 }
@@ -388,6 +428,7 @@ func printChatHelp() {
 	fmt.Println(bold("  Switchyard Controls:"))
 	fmt.Printf("  %-24s %s\n", cyan("/policy <mode>"), "Set execution policy: explain, plan, approve, safe-auto, autopilot")
 	fmt.Printf("  %-24s %s\n", cyan("/preset <name>"), "Set model preset: auto, explore, build, reason, review, or model name")
+	fmt.Printf("  %-24s %s\n", cyan("/budget <usd>"), "Set per-task hard spending cap (e.g. /budget 0.25, 0 to disable)")
 	fmt.Printf("  %-24s %s\n", cyan("/rollback"), "Instantly rollback workspace to pre-task Git Checkpoint")
 	fmt.Printf("  %-24s %s\n", cyan("/stats"), "View session economics, model distribution, and savings vs baseline")
 	fmt.Printf("  %-24s %s\n", cyan("/caveman on|off"), "Toggle concise direct output for maximum token savings")
@@ -403,7 +444,7 @@ func printChatHelp() {
 	fmt.Println()
 }
 
-func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
+func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy, initialBudget float64) {
 	creds, _ := loadCredentials()
 	apiKey := os.Getenv("SWITCHYARD_API_KEY")
 	baseURL := os.Getenv("SWITCHYARD_BASE_URL")
@@ -425,8 +466,15 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
 	}
 
 	if apiKey == "" {
-		fmt.Println(red("Error: Not logged in. Run 'switchyard login' first or pass SWITCHYARD_API_KEY."))
-		return
+		fmt.Println(yellow("No credentials found. Launching Switchyard web authentication..."))
+		newCreds, err := StartWebAuthFlow(DefaultFrontendURL, baseURL)
+		if err != nil {
+			fmt.Println(red(fmt.Sprintf("Authentication failed: %v", err)))
+			fmt.Println(dim("You can log in manually using: switchyard login -key <ngk_...>"))
+			return
+		}
+		creds = newCreds
+		apiKey = creds.APIKey
 	}
 
 	preset := initialPreset
@@ -434,6 +482,7 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
 		preset = "auto"
 	}
 	policy := initialPolicy
+	budget := initialBudget
 	caveman := true
 	stats := newSessionStats()
 	var history []map[string]string
@@ -443,14 +492,14 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
 		projectID = creds.ProjectID
 	}
 
-	printBanner(preset, baseURL, projectID, caveman, policy)
+	printBanner(preset, baseURL, projectID, caveman, policy, budget)
 
 	home, _ := os.UserHomeDir()
 	historyFile := filepath.Join(home, ".switchyard", "chat_history")
 	_ = os.MkdirAll(filepath.Dir(historyFile), 0700)
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          buildPrompt(caveman, policy, preset),
+		Prompt:          buildPrompt(caveman, policy, preset, budget),
 		HistoryFile:     historyFile,
 		AutoComplete:    NewSwitchyardCompleter(),
 		InterruptPrompt: "^C",
@@ -463,7 +512,7 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
 	defer rl.Close()
 
 	for {
-		rl.SetPrompt(buildPrompt(caveman, policy, preset))
+		rl.SetPrompt(buildPrompt(caveman, policy, preset, budget))
 		line, err := rl.Readline()
 		if err != nil {
 			break
@@ -522,6 +571,29 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
 					fmt.Printf("  %s Caveman mode set to: %v\n\n", green("OK"), caveman)
 				}
 
+			case "/budget":
+				if len(parts) < 2 {
+					if budget <= 0 {
+						fmt.Println("  Budget limit: UNLIMITED (no cap)")
+					} else {
+						fmt.Printf("  Budget limit: $%.4f per task\n", budget)
+					}
+					fmt.Println("  Use: /budget <amount> (e.g. /budget 0.25) or /budget 0 to disable")
+				} else {
+					var b float64
+					_, err := fmt.Sscanf(parts[1], "%f", &b)
+					if err != nil || b < 0 {
+						fmt.Println(red("  Invalid budget amount. Example: /budget 0.25"))
+					} else {
+						budget = b
+						if budget == 0 {
+							fmt.Println(green("  OK Budget limit disabled (unlimited spend)."))
+						} else {
+							fmt.Printf("  %s Task budget limit set to $%.4f\n\n", green("OK"), budget)
+						}
+					}
+				}
+
 			case "/stats":
 				stats.Print()
 
@@ -565,7 +637,7 @@ func startInteractiveChat(initialPreset string, initialPolicy ExecutionPolicy) {
 		spinner := newSpinner("Switchyard is analyzing and routing...")
 		spinner.Start()
 
-		result, err := sendChatConversation(baseURL, apiKey, preset, history, caveman)
+		result, err := sendChatConversation(baseURL, apiKey, preset, history, caveman, policy, budget)
 
 		spinner.Stop()
 
@@ -707,7 +779,21 @@ func truncateStr(s string, max int) string {
 	return s[:max] + "..."
 }
 
-func sendChatConversation(baseURL, apiKey, preset string, history []map[string]string, caveman bool) (ChatResult, error) {
+func sendChatConversation(baseURL, apiKey, preset string, history []map[string]string, caveman bool, policy ExecutionPolicy, budget float64) (ChatResult, error) {
+	// 1. Pre-flight budget estimation
+	totalChars := 0
+	for _, m := range history {
+		totalChars += len(m["content"])
+	}
+	estTokens := totalChars / 4
+	if estTokens < 50 {
+		estTokens = 50
+	}
+	preCost := estimateCost(preset, estTokens, 400)
+	if budget > 0 && preCost > budget {
+		return ChatResult{}, fmt.Errorf("BUDGET EXCEEDED: Estimated prompt cost ($%.5f) exceeds task budget limit ($%.5f). Execution aborted before calling models.", preCost, budget)
+	}
+
 	start := time.Now()
 
 	payload := map[string]interface{}{
@@ -728,6 +814,7 @@ func sendChatConversation(baseURL, apiKey, preset string, history []map[string]s
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("X-Switchyard-Policy", string(policy))
 	if caveman {
 		req.Header.Set("X-Nexus-Caveman", "true")
 	}
@@ -781,6 +868,11 @@ func sendChatConversation(baseURL, apiKey, preset string, history []map[string]s
 	latency := time.Since(start)
 	cost := estimateCost(chatResp.Model, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 
+	if budget > 0 && cost > budget {
+		fmt.Printf("\n  %s Actual task spend ($%.5f) exceeded budget limit ($%.5f) by $%.5f.\n",
+			red("[BUDGET ALERT]"), cost, budget, cost-budget)
+	}
+
 	return ChatResult{
 		Content:      chatResp.Choices[0].Message.Content,
 		ModelUsed:    chatResp.Model,
@@ -790,6 +882,114 @@ func sendChatConversation(baseURL, apiKey, preset string, history []map[string]s
 		Cost:         cost,
 		Routing:      chatResp.NexusRouting,
 	}, nil
+}
+
+// runOneShotTask executes a single terminal task non-interactively and exits.
+func runOneShotTask(preset string, policy ExecutionPolicy, budget float64, caveman bool, rawPrompt string) {
+	creds, _ := loadCredentials()
+	apiKey := os.Getenv("SWITCHYARD_API_KEY")
+	baseURL := os.Getenv("SWITCHYARD_BASE_URL")
+
+	if apiKey == "" && creds != nil {
+		apiKey = creds.APIKey
+	}
+	if apiKey == "" {
+		apiKey = os.Getenv("NEXUS_API_KEY")
+	}
+	if baseURL == "" && creds != nil && creds.BaseURL != "" {
+		baseURL = creds.BaseURL
+	}
+	if baseURL == "" {
+		baseURL = os.Getenv("NEXUS_BASE_URL")
+	}
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
+	}
+
+	if apiKey == "" {
+		fmt.Println(yellow("No credentials found. Launching Switchyard web authentication..."))
+		newCreds, err := StartWebAuthFlow(DefaultFrontendURL, baseURL)
+		if err != nil {
+			fmt.Println(red(fmt.Sprintf("Authentication failed: %v", err)))
+			fmt.Println(dim("You can log in manually using: switchyard login -key <ngk_...>"))
+			os.Exit(1)
+		}
+		creds = newCreds
+		apiKey = creds.APIKey
+	}
+
+	// 1. Expand @mentions into context
+	expandedPrompt, items, ctxErrs := ExpandPromptContext(rawPrompt)
+	for _, err := range ctxErrs {
+		fmt.Printf("  %s %v\n", yellow("[Context Warning]"), err)
+	}
+	if len(items) > 0 {
+		var names []string
+		for _, it := range items {
+			if it.IsDir {
+				names = append(names, fmt.Sprintf("%s/ (%d items)", it.Path, it.Children))
+			} else {
+				names = append(names, fmt.Sprintf("%s (%d lines)", it.Path, it.Lines))
+			}
+		}
+		fmt.Printf("  %s %s\n", dim("[Attached Context]"), dim(strings.Join(names, ", ")))
+	}
+
+	history := []map[string]string{
+		{"role": "user", "content": expandedPrompt},
+	}
+
+	spinner := newSpinner("Switchyard is analyzing task and routing...")
+	spinner.Start()
+
+	result, err := sendChatConversation(baseURL, apiKey, preset, history, caveman, policy, budget)
+	spinner.Stop()
+
+	if err != nil {
+		fmt.Printf("\n  %s %v\n\n", red("Error:"), err)
+		if strings.Contains(err.Error(), "BUDGET EXCEEDED") {
+			os.Exit(2)
+		}
+		os.Exit(1)
+	}
+
+	// Print Explainable Routing Decision Trace
+	if result.Routing != nil {
+		printRoutingDecision(result.Routing)
+	}
+
+	fmt.Printf("\n%s\n%s\n", bold(cyan("Switchyard:")), result.Content)
+	printResponseMeta(result, preset)
+
+	// Apply edits under policy
+	proposedEdits := ParseProposedEdits(result.Content)
+	if len(proposedEdits) > 0 {
+		taskDesc := rawPrompt
+		if len(taskDesc) > 50 {
+			taskDesc = taskDesc[:50] + "..."
+		}
+		applied, blocked, editErrs := ApplyEditsWithPolicy(proposedEdits, policy, taskDesc)
+		for _, err := range editErrs {
+			fmt.Printf("  %s %v\n", red("[Edit Error]"), err)
+		}
+		if applied > 0 {
+			fmt.Printf("\n  %s Applied %d code modification(s) under policy '%s'.\n",
+				green("SUCCESS:"), applied, bold(string(policy)))
+		}
+		if blocked > 0 {
+			fmt.Printf("  %s Blocked %d protected file modification(s).\n",
+				yellow("GUARDRAIL:"), blocked)
+		}
+	}
+
+	// Task budget report
+	if budget > 0 {
+		rem := budget - result.Cost
+		if rem >= 0 {
+			fmt.Printf("  %s Spent $%.5f of $%.5f budget limit ($%.5f remaining)\n\n",
+				dim("[Budget]"), result.Cost, budget, rem)
+		}
+	}
 }
 
 type spinner struct {

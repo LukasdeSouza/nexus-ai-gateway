@@ -35,6 +35,23 @@ type Dependencies struct {
 	ProvidersHandler     http.Handler
 	UsageHandler         http.HandlerFunc
 	RequestsHandler      http.HandlerFunc
+	CliAuthHandler       http.HandlerFunc
+	CliRotateHandler     http.HandlerFunc
+}
+
+// corsMiddleware handles Cross-Origin Resource Sharing for browser access.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token, apikey, X-Nexus-Caveman, X-Switchyard-Policy, X-Nexus-Project-ID")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // New creates a configured HTTP server with all middleware and routes registered.
@@ -42,6 +59,7 @@ func New(deps Dependencies) *Server {
 	r := chi.NewRouter()
 
 	// --- Core middleware stack ---
+	r.Use(corsMiddleware)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.Recoverer)
@@ -57,6 +75,14 @@ func New(deps Dependencies) *Server {
 
 	// --- v1 API ---
 	r.Route("/v1", func(r chi.Router) {
+		// CLI Web Authentication & Key Rotation
+		if deps.CliAuthHandler != nil {
+			r.Post("/auth/cli-key", deps.CliAuthHandler)
+		}
+		if deps.CliRotateHandler != nil {
+			r.Post("/auth/rotate-key", deps.CliRotateHandler)
+		}
+
 		// OpenAI-compatible inference endpoint
 		r.Post("/chat/completions", deps.ChatHandler)
 

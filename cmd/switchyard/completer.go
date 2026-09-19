@@ -24,6 +24,7 @@ func NewSwitchyardCompleter() *SwitchyardCompleter {
 			"/model",
 			"/rollback",
 			"/stats",
+			"/budget",
 			"/caveman",
 			"/models",
 			"/usage",

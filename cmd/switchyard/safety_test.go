@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"testing"
@@ -53,4 +53,27 @@ func TestIsProtectedFile(t *testing.T) {
 		isP, _ := IsProtectedFile(tc.path)
 		assert.Equal(t, tc.protected, isP, "path: %s", tc.path)
 	}
+}
+
+func TestPrintExecutionPlanManifest(t *testing.T) {
+	edits := []ProposedEdit{
+		{FilePath: "index.html", Action: "write", NewText: "<h1>Hello</h1>"},
+		{FilePath: ".env", Action: "write", NewText: "SECRET=123"},
+		{FilePath: "main.go", Action: "edit", OldText: "foo", NewText: "bar"},
+	}
+
+	// Should not panic and properly format
+	assert.NotPanics(t, func() {
+		PrintExecutionPlanManifest(edits, PolicyApprove)
+		PrintExecutionPlanManifest(edits, PolicySafeAuto)
+		PrintExecutionPlanManifest(edits, PolicyExplain)
+	})
+}
+
+func TestEstimateCost(t *testing.T) {
+	cost := estimateCost("explore", 1000, 500)
+	assert.Greater(t, cost, 0.0)
+
+	costBuild := estimateCost("build", 1000, 500)
+	assert.Greater(t, costBuild, cost)
 }

@@ -141,11 +141,28 @@ func main() {
 		},
 	})
 
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+	if supabaseKey == "" {
+		supabaseKey = os.Getenv("SUPABASE_ANON_KEY")
+	}
+
+	cliAuthH := handlers.NewCliAuthHandler(handlers.CliAuthHandlerConfig{
+		OrgStore:     orgRepo,
+		ProjectStore: prjRepo,
+		KeyStore:     keyRepo,
+		SupabaseURL:  supabaseURL,
+		SupabaseKey:  supabaseKey,
+		Logger:       logger,
+	})
+
 	server := gateway.New(gateway.Dependencies{
 		Config:               cfg,
 		Logger:               logger,
 		Metrics:              metrics,
 		ChatHandler:          chatH.ServeHTTP,
+		CliAuthHandler:       cliAuthH.ServeHTTP,
+		CliRotateHandler:     cliAuthH.RotateKey,
 		ModelsHandler:        handlers.NewModelsHandler(aliasRepo),
 		OrganizationsHandler: handlers.NewOrganizationsRouter(orgRepo),
 		ProjectsHandler:      handlers.NewProjectsRouter(prjRepo),

@@ -99,8 +99,8 @@ type messageRequest struct {
 	Content string `json:"content"`
 }
 
-const codingAgentSystemPrompt = `You are Nexus, an elite AI coding assistant and agent.
-When the user asks you to modify, edit, or create files, output your proposed changes using the exact block formats below so the Nexus CLI can inspect diffs and apply them safely to disk:
+const codingAgentSystemPrompt = `You are Switchyard, the routing, cost, and safety layer for terminal-based AI coding agents.
+When the user asks you to modify, edit, or create files, output your proposed changes using the exact block formats below so Switchyard can inspect diffs and apply them safely to disk:
 
 1. To edit an existing file with surgical precision (Search/Replace):
 ` + "```edit:path/to/file.ext\n<<<<<<< SEARCH\nexact original code snippet to replace\n=======\nexact new code snippet\n>>>>>>> REPLACE\n```" + `
@@ -196,7 +196,25 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cavemanEnabled = false
 	}
 
-	systemDirective := codingAgentSystemPrompt
+	// Read Execution Policy
+	policyHeader := r.Header.Get("X-Switchyard-Policy")
+	if policyHeader == "" {
+		policyHeader = r.Header.Get("X-Nexus-Policy")
+	}
+	if val, ok := reqBody.Metadata["policy"]; ok && val != "" {
+		policyHeader = val
+	}
+
+	var systemDirective string
+	switch strings.ToLower(strings.TrimSpace(policyHeader)) {
+	case "explain":
+		systemDirective = "You are Switchyard in EXPLAIN mode (read-only).\nAnswer the user's questions clearly with detailed technical explanations, debugging insights, and code snippets in standard markdown code blocks.\nDO NOT output ```edit: or ```write: blocks because file modifications are strictly forbidden in explain mode."
+	case "plan":
+		systemDirective = "You are Switchyard in PLAN mode (planning & inspection).\nProvide structured implementation plans, architecture designs, and code previews in standard markdown code blocks.\nDO NOT output ```edit: or ```write: blocks because disk modifications are forbidden in plan mode."
+	default:
+		systemDirective = codingAgentSystemPrompt
+	}
+
 	if cavemanEnabled {
 		systemDirective += "\nRespond directly and concisely. No fluff, no filler, no pleasantries. Optimize for brevity and token savings."
 	}
