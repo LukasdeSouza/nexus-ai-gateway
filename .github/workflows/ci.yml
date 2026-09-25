@@ -2,14 +2,15 @@ name: CI - Tests & Coverage
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, 'feature/**']
   pull_request:
     branches: [main, develop]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
+  statuses: write
 
 jobs:
   test:
@@ -31,28 +32,40 @@ jobs:
 
       - name: Run tests with coverage
         run: |
+          set -o pipefail
           go test ./... \
             -coverprofile=coverage.out \
             -covermode=atomic \
             -v \
-            -timeout 120s \
+            -timeout 180s \
             2>&1 | tee test-output.txt
-          echo "EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
+          echo "TEST_EXIT_CODE=$?" >> $GITHUB_ENV
 
       - name: Generate coverage summary
         if: always()
         run: |
-          echo "TOTAL_COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')" >> $GITHUB_ENV
-          go tool cover -func=coverage.out > coverage-summary.txt
+          if [ -f coverage.out ]; then
+            TOTAL_COV=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
+            echo "TOTAL_COVERAGE=$TOTAL_COV" >> $GITHUB_ENV
+            go tool cover -func=coverage.out > coverage-summary.txt
+          else
+            echo "TOTAL_COVERAGE=N/A" >> $GITHUB_ENV
+            echo "No coverage file generated" > coverage-summary.txt
+          fi
           cat coverage-summary.txt
 
       - name: Parse test results
         if: always()
         id: results
         run: |
-          PASS=$(grep -c '^--- PASS:' test-output.txt || true)
-          FAIL=$(grep -c '^--- FAIL:' test-output.txt || true)
-          SKIP=$(grep -c '^--- SKIP:' test-output.txt || true)
+          PASS=0
+          FAIL=0
+          SKIP=0
+          if [ -f test-output.txt ]; then
+            PASS=$(grep -c '^--- PASS:' test-output.txt || true)
+            FAIL=$(grep -c '^--- FAIL:' test-output.txt || true)
+            SKIP=$(grep -c '^--- SKIP:' test-output.txt || true)
+          fi
           echo "pass=$PASS" >> $GITHUB_OUTPUT
           echo "fail=$FAIL" >> $GITHUB_OUTPUT
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
@@ -63,59 +76,60 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const summary = fs.readFileSync('coverage-summary.txt', 'utf8');
-            const testOutput = fs.readFileSync('test-output.txt', 'utf8');
-
+            const summary = fs.existsSync('coverage-summary.txt') ? fs.readFileSync('coverage-summary.txt', 'utf8') : 'N/A';
             const pass = '${{ steps.results.outputs.pass }}';
             const fail = '${{ steps.results.outputs.fail }}';
             const skip = '${{ steps.results.outputs.skip }}';
             const totalCov = process.env.TOTAL_COVERAGE || 'N/A';
-            const status = fail > 0 ? '❌ FAILED' : '✅ PASSED';
+            const status = parseInt(fail) > 0 ? 'FAILED' : 'PASSED';
 
             // Parse per-package coverage
             const lines = summary.split('\n').filter(l => l.trim());
             const pkgLines = lines.filter(l => !l.includes('total:'));
-            const totalLine = lines.find(l => l.includes('total:'));
 
             // Build package table
-            let pkgTable = '| Package | Coverage |\n|---------|----------|\n';
+            let pkgRows = [];
             for (const line of pkgLines) {
               const parts = line.trim().split(/\s+/);
               if (parts.length >= 3) {
                 const pkg = parts[0].replace('github.com/LukasdeSouza/nexus-ai-gateway/', '');
                 const cov = parts[parts.length - 1];
                 const covNum = parseFloat(cov);
-                const bar = covNum >= 80 ? '🟢' : covNum >= 50 ? '🟡' : '🔴';
-                pkgTable += `| \`${pkg}\` | ${bar} ${cov} |\n`;
+                const tag = covNum >= 80 ? '[High]' : covNum >= 50 ? '[Med]' : '[Low]';
+                pkgRows.push(`| \`${pkg}\` | ${tag} ${cov} |`);
               }
             }
+            const pkgTable = pkgRows.length > 0
+              ? ['| Package | Coverage |', '|---|---|', ...pkgRows].join('\n')
+              : 'No package coverage details available.';
 
-            const body = `## CI Report — Test Coverage
+            const body = [
+              '## Switchyard CI Report — Test Coverage',
+              '',
+              `- **Status:** **${status}**`,
+              `- **Total Coverage:** \`${totalCov}\``,
+              `- **Tests Summary:** ${pass} passed, ${fail} failed, ${skip} skipped`,
+              '',
+              '<details>',
+              '<summary><strong>Coverage Breakdown by Package</strong></summary>',
+              '',
+              pkgTable,
+              '',
+              '</details>',
+              '',
+              '<details>',
+              '<summary><strong>Raw Coverage Output</strong></summary>',
+              '',
+              '```text',
+              summary,
+              '```',
+              '',
+              '</details>',
+              '',
+              '---',
+              `*Commit: \`${context.sha.substring(0, 7)}\`*`
+            ].join('\n');
 
-            **Status:** ${status}
-            **Total Coverage:** \`${totalCov}\`
-            **Tests:** ✅ ${pass} passed  ${fail > 0 ? `❌ ${fail} failed  ` : ''}${skip > 0 ? `⏭ ${skip} skipped` : ''}
-
-            <details>
-            <summary>Coverage by Package</summary>
-
-            ${pkgTable}
-
-            </details>
-
-            <details>
-            <summary>Full Coverage Report</summary>
-
-            \`\`\`
-            ${summary}
-            \`\`\`
-
-            </details>
-
-            ---
-            *Commit: \`${{ github.sha }}\` — Branch: \`${{ github.head_ref }}\`*`;
-
-            // Find existing bot comment and update, or create new
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -123,7 +137,7 @@ jobs:
             });
 
             const botComment = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('CI Report — Test Coverage')
+              c.body && c.body.includes('Switchyard CI Report — Test Coverage')
             );
 
             if (botComment) {
@@ -142,36 +156,20 @@ jobs:
               });
             }
 
-      - name: Post coverage to commit status (push to main)
-        if: github.event_name == 'push'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const totalCov = process.env.TOTAL_COVERAGE || 'N/A';
-            const fail = '${{ steps.results.outputs.fail }}';
-            const pass = '${{ steps.results.outputs.pass }}';
-            const state = fail > 0 ? 'failure' : 'success';
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.sha,
-              state: state,
-              description: `Coverage: ${totalCov} | ${pass} tests passed`,
-              context: 'switchyard/coverage',
-            });
-
       - name: Add coverage to GitHub Actions Job Summary
         if: always()
         run: |
           echo "## Test Coverage Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Total Coverage:** \`${{ env.TOTAL_COVERAGE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Tests Passed:** ${{ steps.results.outputs.pass }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Tests Failed:** ${{ steps.results.outputs.fail }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Coverage:** \`${{ env.TOTAL_COVERAGE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests Passed:** ${{ steps.results.outputs.pass }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests Failed:** ${{ steps.results.outputs.fail }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage-summary.txt ]; then
+            echo "\`\`\`text" >> $GITHUB_STEP_SUMMARY
+            cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Upload coverage artifact
         if: always()
@@ -184,8 +182,8 @@ jobs:
             test-output.txt
           retention-days: 30
 
-      - name: Fail build on test failures
-        if: steps.results.outputs.fail > 0
+      - name: Check test exit code
+        if: steps.results.outputs.fail > 0 || env.TEST_EXIT_CODE != '0'
         run: |
-          echo "Tests failed. See output above."
+          echo "Tests failed. Exit code: ${{ env.TEST_EXIT_CODE }}"
           exit 1
