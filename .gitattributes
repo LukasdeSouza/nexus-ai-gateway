@@ -1,0 +1,25 @@
+# Normalize all line endings to LF on checkout
+* text=auto eol=lf
+
+# Go source files - always LF, never BOM
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+
+# YAML/JSON config
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Shell scripts - always LF
+*.sh text eol=lf
+
+# SQL migrations - always LF
+*.sql text eol=lf
+
+# Markdown docs
+*.md text eol=lf
+
+# Binaries - no line ending conversion
+*.exe binary
+*.out binary

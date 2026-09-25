@@ -1,0 +1,32 @@
+{
+  "name": "switchyard-ai",
+  "version": "1.0.0",
+  "description": "Switchyard - The Routing, Cost & Safety Layer for AI Coding Agents",
+  "main": "./bin/switchyard.js",
+  "bin": {
+    "switchyard": "bin/switchyard.js",
+    "sy": "bin/switchyard.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "keywords": [
+    "switchyard",
+    "ai",
+    "coding-agent",
+    "router",
+    "gateway",
+    "llm",
+    "cli",
+    "anthropic",
+    "gemini",
+    "openai"
+  ],
+  "author": "Lucas de Souza",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LukasdeSouza/nexus-ai-gateway.git"
+  }
+}
